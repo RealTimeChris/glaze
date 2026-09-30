@@ -795,6 +795,16 @@ namespace glz_ko
       }
    }
 
+   consteval bool check_known_order(auto&& Opts)
+   {
+      if constexpr (requires { Opts.known_order; }) {
+         return Opts.known_order;
+      }
+      else {
+         return false;
+      }
+   }
+
    consteval bool check_linear_search(auto&& Opts)
    {
       if constexpr (requires { Opts.linear_search; }) {

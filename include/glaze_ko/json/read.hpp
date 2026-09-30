@@ -492,6 +492,74 @@ namespace glz_ko
       }
    }
 
+   template <class T, size_t N>
+   inline thread_local constinit std::array<size_t, N> known_order_indices = [] {
+      std::array<size_t, N> indices{};
+      for (size_t i = 0; i < N; ++i) {
+         indices[i] = i;
+      }
+      return indices;
+   }();
+
+   template <auto Opts, class T, size_t I, class Value>
+      requires(glaze_object_t<T> || reflectable<T>)
+   GLZKO_ALWAYS_INLINE bool decode_known_index(Value&& value, is_context auto&& ctx, auto&& it, auto&& end)
+   {
+      static constexpr auto Key = get<I>(reflect<T>::keys);
+      static constexpr auto KeyWithEndQuote = join_v<Key, chars<"\"">>;
+      static constexpr auto Length = KeyWithEndQuote.size();
+
+      if (((end - it) > std::ptrdiff_t(Length)) && comparitor<KeyWithEndQuote>(it)) [[likely]] {
+         it += Length;
+         if constexpr (not Opts.null_terminated) {
+            if (it == end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return true;
+            }
+         }
+         if (skip_ws<Opts>(ctx, it, end)) {
+            return true;
+         }
+         if (match_invalid_end<':', Opts>(ctx, it, end)) {
+            return true;
+         }
+         if (skip_ws<Opts>(ctx, it, end)) {
+            return true;
+         }
+         decode_field_value<Opts, ws_handled<Opts>(), T, I>(value, ctx, it, end);
+         return true;
+      }
+      return false;
+   }
+
+   template <auto Opts, class T, class Value>
+      requires(glaze_object_t<T> || reflectable<T>)
+   GLZKO_ALWAYS_INLINE void parse_and_invoke_known_order(Value&& value, is_context auto&& ctx, auto&& it, auto&& end,
+                                                         const size_t position)
+   {
+      constexpr auto N = reflect<T>::size;
+      auto& indices = known_order_indices<T, N>;
+
+      if (position < N) [[likely]] {
+         bool hit{};
+         visit<N>([&]<size_t I>() { hit = decode_known_index<Opts, T, I>(value, ctx, it, end); }, indices[position]);
+         if (hit) [[likely]] {
+            return;
+         }
+      }
+
+      constexpr auto& HashInfo = hash_info<T>;
+      const auto index = decode_hash<JSON, T, HashInfo, HashInfo.type>::op(it, end);
+      if (index >= N) [[unlikely]] {
+         parse_and_invoke<Opts, T>(value, ctx, it, end);
+         return;
+      }
+      if (position < N) {
+         indices[position] = index;
+      }
+      visit<N>([&]<size_t I>() { decode_index<Opts, T, I>(value, ctx, it, end); }, index);
+   }
+
    template <is_member_function_pointer T>
    struct from<JSON, T>
    {
@@ -2938,6 +3006,7 @@ namespace glz_ko
                }()};
 
             size_t read_count{}; // for partial_read
+            [[maybe_unused]] size_t position{};
 
             bool first = true;
             while (true) {
@@ -3176,6 +3245,12 @@ namespace glz_ko
                      if (index < num_members) {
                         fields[index] = true;
                      }
+                  }
+                  else if constexpr (check_known_order(Opts) && (num_members > 1) && !check_linear_search(Opts)) {
+                     parse_and_invoke_known_order<Opts, T>(value, ctx, it, end, position);
+                     ++position;
+                     if (bool(ctx.error)) [[unlikely]]
+                        return;
                   }
                   else {
                      parse_and_invoke<Opts, T>(value, ctx, it, end);
