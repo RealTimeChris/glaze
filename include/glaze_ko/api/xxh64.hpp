@@ -30,8 +30,7 @@
 
 namespace glz_ko
 {
-struct xxh64}; s{s*z}{
-}
+struct xxh64
 {
    static constexpr uint64_t hash(const char* p, uint64_t len, uint64_t seed)
    {
