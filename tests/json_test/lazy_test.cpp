@@ -1,10 +1,123 @@
 // Glaze Library
 // For the license information refer to glaze.hpp
 
+#include <concepts>
+#include <utility>
+#include <vector>
+
 #include "glaze/json.hpp"
 #include "ut/ut.hpp"
 
 using namespace ut;
+
+// A user options struct that derives from glz::opts to carry an extra field, which is the
+// pattern glz::opts documents ("Add these fields to a custom options struct if you want to
+// use them"). The lazy API must instantiate on the exact type so the derived field survives.
+struct custom_lazy_opts : glz::opts
+{
+   bool bools_as_numbers = true;
+};
+
+inline constexpr custom_lazy_opts derived_opts{};
+
+struct BoolHolder
+{
+   bool flag{};
+};
+
+// Streaming cursor option matrix. Every cursor test is differential: the same traversal is run
+// with the cursor on and off and the two results must agree, so the cursor can only ever be a
+// speed difference, never a behavior difference.
+struct cursor_on_opts : glz::opts
+{
+   bool lazy_streaming_cursor = true;
+};
+
+struct cursor_off_opts : glz::opts
+{
+   bool lazy_streaming_cursor = false;
+};
+
+// Non-null-terminated input, the mode a caller feeding bounded string_views uses.
+struct cursor_on_bounded_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool lazy_streaming_cursor = true;
+};
+
+struct cursor_off_bounded_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool lazy_streaming_cursor = false;
+};
+
+// partial_read leaves the parser short of the value's true end. The cursor must not mistake
+// that stopping point for the end of the element.
+struct cursor_on_partial_opts : glz::opts
+{
+   bool partial_read = true;
+   bool lazy_streaming_cursor = true;
+};
+
+struct cursor_off_partial_opts : glz::opts
+{
+   bool partial_read = true;
+   bool lazy_streaming_cursor = false;
+};
+
+inline constexpr cursor_on_opts cursor_on{};
+inline constexpr cursor_off_opts cursor_off{};
+inline constexpr cursor_on_bounded_opts cursor_on_bounded{};
+inline constexpr cursor_off_bounded_opts cursor_off_bounded{};
+inline constexpr cursor_on_partial_opts cursor_on_partial{};
+inline constexpr cursor_off_partial_opts cursor_off_partial{};
+
+// Wide number skip. Like the cursor, it is only ever a speed difference, so its tests compare
+// the option on against the option off. Non-null-terminated only, which is where it applies.
+struct wide_num_on_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool lazy_wide_number_skip = true;
+};
+
+struct wide_num_off_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool lazy_wide_number_skip = false;
+};
+
+inline constexpr wide_num_on_opts wide_num_on{};
+inline constexpr wide_num_off_opts wide_num_off{};
+
+struct Cell
+{
+   int a{};
+   std::string s{};
+};
+
+// A reader that deliberately stops inside the value: it takes '[' and the first element, leaving
+// the iterator on an interior comma without reporting an error. Glaze's own readers do not behave
+// this way, but from<JSON, T> is a public extension point, so the cursor must not trust `it`.
+struct FirstOfPair
+{
+   int v{};
+};
+
+template <>
+struct glz::from<glz::JSON, FirstOfPair>
+{
+   template <auto Opts, class... Args>
+   static void op(FirstOfPair& value, glz::is_context auto&& ctx, auto&& it, auto end)
+   {
+      ++it; // '['
+      glz::parse<glz::JSON>::op<Opts>(value.v, ctx, it, end);
+   }
+};
+
+struct CellId
+{
+   int a{};
+};
 
 struct User
 {
@@ -243,6 +356,29 @@ suite lazy_json_tests = [] {
       auto float_result = doc["value"].get<float>();
       expect(float_result.has_value());
       expect(std::abs(float_result.value() - 2.5f) < 0.001f);
+   };
+
+   // An exponent marker needs at least one digit after it and its optional sign
+   "lazy_json_empty_exponent"_test = [] {
+      for (const std::string_view num : {"1e", "1.0E", "1.0e-", "1e+"}) {
+         std::string scalar{num};
+         auto root = glz::lazy_json(scalar);
+         expect(root.has_value());
+         expect(!root->root().get<double>().has_value()) << num;
+         expect(!root->root().get<float>().has_value()) << num;
+         expect(!root->root().get<int64_t>().has_value()) << num;
+
+         std::string object = R"({"value":)" + scalar + "}";
+         auto doc = glz::lazy_json(object);
+         expect(doc.has_value());
+         expect(!(*doc)["value"].get<double>().has_value()) << num;
+         expect(!(*doc)["value"].get<float>().has_value()) << num;
+      }
+
+      std::string valid = R"({"value":1.5e+2})";
+      auto doc = glz::lazy_json(valid);
+      expect(doc.has_value());
+      expect((*doc)["value"].get<double>().value() == 150.0);
    };
 
    "lazy_json_large_array"_test = [] {
@@ -1580,6 +1716,733 @@ suite dynamic_key_custom_tests = [] {
       expect((*result).root().size() == 1u); // '@' scalar, then bounded by json_end_
       expect((*result).root().index().size() == 1u);
       expect((*result).root()[1].has_error()); // nothing past the lone scalar
+   };
+};
+
+// Regression coverage for the lazy API taking `opts` (a concrete base-class NTTP) rather than
+// `auto`, which sliced any derived user options struct down to glz::opts and silently dropped
+// every extra field.
+suite lazy_derived_opts_tests = [] {
+   "lazy_derived_opts_preserve_exact_type"_test = [] {
+      // Sliced to glz::opts, these would collapse to the same instantiation.
+      expect(not std::same_as<glz::lazy_document<derived_opts>, glz::lazy_document<glz::opts{}>>);
+      expect(not std::same_as<glz::lazy_json_view<derived_opts>, glz::lazy_json_view<glz::opts{}>>);
+   };
+
+   "lazy_derived_opts_reach_read_into"_test = [] {
+      // bools_as_numbers only exists on the derived struct, so it reaches the parser only if
+      // the lazy API instantiated on custom_lazy_opts rather than on a sliced glz::opts.
+      std::string buffer = R"({"obj":{"flag":1}})";
+      auto result = glz::lazy_json<derived_opts>(buffer);
+      expect(result.has_value());
+
+      BoolHolder holder{};
+      expect(not(*result)["obj"].read_into(holder));
+      expect(holder.flag == true);
+   };
+};
+
+// ============================================================================
+// Streaming cursor (lazy_streaming_cursor)
+// ============================================================================
+
+// Each helper renders a traversal to a string so cursor-on and cursor-off runs can be compared
+// exactly. Any divergence - a skipped element, a bogus extra one, a changed value - shows up as
+// a string mismatch rather than a silently equal checksum.
+
+template <auto Opts>
+std::string traverse_read_into(std::string_view json)
+{
+   auto doc = glz::lazy_json<Opts>(json);
+   if (not doc) return "<parse-error>";
+   std::string out;
+   for (auto& row : (*doc)["rows"]) {
+      Cell cell{};
+      if (row.read_into(cell)) {
+         out += "!;";
+      }
+      else {
+         out += std::to_string(cell.a) + ':' + cell.s + ';';
+      }
+   }
+   return out;
+}
+
+// Nested containers: the inner loop runs to completion, which is what lets the outer advance
+// jump. Exercises the self-composing extent.
+template <auto Opts>
+std::string traverse_nested(std::string_view json)
+{
+   auto doc = glz::lazy_json<Opts>(json);
+   if (not doc) return "<parse-error>";
+   std::string out;
+   for (auto& row : (*doc)["rows"]) {
+      out += '[';
+      for (auto& cell : row) {
+         int v{};
+         if (cell.read_into(v)) {
+            out += "!,";
+         }
+         else {
+            out += std::to_string(v) + ',';
+         }
+      }
+      out += ']';
+   }
+   return out;
+}
+
+// Mixes the access patterns that produce and consume extents: read_into on some rows, keyed
+// access (which drives parse_pos_ instead) on others, and rows left entirely untouched.
+template <auto Opts>
+std::string traverse_mixed(std::string_view json)
+{
+   auto doc = glz::lazy_json<Opts>(json);
+   if (not doc) return "<parse-error>";
+   std::string out;
+   int n = 0;
+   for (auto& row : (*doc)["rows"]) {
+      switch (n++ % 3) {
+      case 0: {
+         Cell cell{};
+         out += row.read_into(cell) ? "!;" : std::to_string(cell.a) + ':' + cell.s + ';';
+         break;
+      }
+      case 1: {
+         auto a = row["a"].template get<int64_t>();
+         out += a ? std::to_string(a.value()) + '#' : "!#";
+         break;
+      }
+      default:
+         out += "-";
+         break;
+      }
+   }
+   return out;
+}
+
+suite lazy_streaming_cursor_tests = [] {
+   // Every shape below is run through both option sets and must agree.
+   const std::string rows = R"({"rows":[{"a":1,"s":"one"},{"a":2,"s":"two"},{"a":3,"s":"three"}]})";
+   const std::string nested = R"({"rows":[[1,2,3],[],[4],[5,6,7,8]]})";
+   const std::string empty_rows = R"({"rows":[]})";
+   const std::string single = R"({"rows":[{"a":9,"s":"only"}]})";
+   const std::string escaped = R"({"rows":[{"a":1,"s":"a\"b,]}"},{"a":2,"s":"]}\\"}]})";
+   const std::string deep = R"({"rows":[{"a":1,"s":"x"},{"a":2,"s":"y"},{"a":3,"s":"z"},{"a":4,"s":"w"}]})";
+
+   "cursor_read_into_matches_uncursored"_test = [&] {
+      for (const auto& json : {rows, empty_rows, single, escaped, deep}) {
+         const auto with = traverse_read_into<cursor_on>(json);
+         const auto without = traverse_read_into<cursor_off>(json);
+         expect(with == without) << json;
+         expect(not with.empty() or json == empty_rows);
+      }
+      expect(traverse_read_into<cursor_on>(rows) == "1:one;2:two;3:three;");
+   };
+
+   "cursor_nested_containers_match_uncursored"_test = [&] {
+      expect(traverse_nested<cursor_on>(nested) == traverse_nested<cursor_off>(nested));
+      expect(traverse_nested<cursor_on>(nested) == "[1,2,3,][][4,][5,6,7,8,]");
+   };
+
+   "cursor_mixed_access_matches_uncursored"_test = [&] {
+      for (const auto& json : {rows, single, escaped, deep}) {
+         expect(traverse_mixed<cursor_on>(json) == traverse_mixed<cursor_off>(json)) << json;
+      }
+      expect(traverse_mixed<cursor_on>(deep) == "1:x;2#-4:w;");
+   };
+
+   "cursor_bounded_buffer_matches_uncursored"_test = [&] {
+      // A trailing tail past the logical end catches any read beyond json_end().
+      std::string backing = R"({"rows":[{"a":1,"s":"one"},{"a":2,"s":"two"}]}TRAILING_NON_JSON)";
+      const std::string_view json{backing.data(), backing.find("]}") + 2};
+
+      expect(traverse_read_into<cursor_on_bounded>(json) == traverse_read_into<cursor_off_bounded>(json));
+      expect(traverse_read_into<cursor_on_bounded>(json) == "1:one;2:two;");
+   };
+
+   "cursor_under_partial_read_matches_uncursored"_test = [&] {
+      // partial_read stops the parser inside the object once its known keys are filled, and
+      // finalize_read_context downgrades that to success. Recording `it` as the element end
+      // would land the next advance in the middle of the object and desynchronize iteration.
+      const std::string wide = R"({"rows":[{"a":1,"b":7,"c":8},{"a":2,"b":7,"c":8},{"a":3,"b":7,"c":8}]})";
+
+      auto collect = []<auto Opts>(std::string_view json) {
+         auto doc = glz::lazy_json<Opts>(json);
+         std::string out;
+         int guard = 0;
+         for (auto& row : (*doc)["rows"]) {
+            CellId cell{};
+            out += row.read_into(cell) ? "!;" : std::to_string(cell.a) + ';';
+            if (++guard > 16) return out + "<runaway>";
+         }
+         return out;
+      };
+
+      const auto with = collect.template operator()<cursor_on_partial>(wide);
+      const auto without = collect.template operator()<cursor_off_partial>(wide);
+      expect(with == without);
+      expect(with == "1;2;3;");
+   };
+
+   "cursor_interleaved_iterators_share_one_slot"_test = [&] {
+      // Two live iterators over the same document write to the same extent slot. The
+      // pointer-identity check must keep each advance honest.
+      const std::string json = R"({"x":[{"a":1,"s":"p"},{"a":2,"s":"q"},{"a":3,"s":"r"}],)"
+                               R"("y":[{"a":10,"s":"P"},{"a":20,"s":"Q"},{"a":30,"s":"R"}]})";
+      auto doc = glz::lazy_json<cursor_on>(json);
+      expect(doc.has_value());
+
+      auto xs = (*doc)["x"];
+      auto ys = (*doc)["y"];
+      auto ix = xs.begin();
+      auto iy = ys.begin();
+
+      std::string out;
+      int guard = 0;
+      while (ix != xs.end() && iy != ys.end()) {
+         Cell a{};
+         Cell b{};
+         expect(not(*ix).read_into(a));
+         expect(not(*iy).read_into(b));
+         out += std::to_string(a.a) + a.s + std::to_string(b.a) + b.s + ';';
+         ++ix;
+         ++iy;
+         if (++guard > 16) break;
+      }
+      expect(out == "1p10P;2q20Q;3r30R;");
+   };
+
+   "cursor_survives_document_copy_and_move"_test = [&] {
+      // The extent is stored as offsets, so a copied or moved document rebases onto its own
+      // buffer pointer rather than dangling into the original.
+      auto original = glz::lazy_json<cursor_on>(rows);
+      expect(original.has_value());
+
+      auto it = (*original)["rows"].begin();
+      Cell first{};
+      expect(not(*it).read_into(first)); // leaves a live extent on the document
+      expect(first.a == 1);
+
+      auto copied = *original; // copy with the extent live
+      auto moved = std::move(copied);
+
+      std::string out;
+      for (auto& row : moved["rows"]) {
+         Cell cell{};
+         out += row.read_into(cell) ? "!;" : std::to_string(cell.a) + ':' + cell.s + ';';
+      }
+      expect(out == "1:one;2:two;3:three;");
+   };
+
+   "cursor_repeated_traversals_are_stable"_test = [&] {
+      // A second pass over the same document must see the same elements: an extent left over
+      // from the first pass may not leak into the second.
+      auto doc = glz::lazy_json<cursor_on>(rows);
+      expect(doc.has_value());
+
+      std::string first;
+      std::string second;
+      for (auto& row : (*doc)["rows"]) {
+         Cell cell{};
+         first += row.read_into(cell) ? "!;" : std::to_string(cell.a) + ';';
+      }
+      for (auto& row : (*doc)["rows"]) {
+         Cell cell{};
+         second += row.read_into(cell) ? "!;" : std::to_string(cell.a) + ';';
+      }
+      expect(first == "1;2;3;");
+      expect(first == second);
+   };
+
+   "cursor_ignores_over_consuming_reader"_test = [] {
+      // glz::text swallows everything from the value start to the end of the buffer and reports
+      // success. Taking its stopping point as the element end would record an extent covering the
+      // rest of the document and silently end iteration after one element.
+      const std::string json = R"([{"a":1},{"a":2},{"a":3}])";
+
+      auto collect = []<auto Opts>() {
+         const std::string_view src{R"([{"a":1},{"a":2},{"a":3}])"};
+         auto doc = glz::lazy_json<Opts>(src);
+         int count{};
+         for (auto& e : doc->root()) {
+            glz::text t{};
+            expect(not e.read_into(t));
+            if (++count > 8) break;
+         }
+         return count;
+      };
+
+      expect(collect.template operator()<cursor_on>() == 3);
+      expect(collect.template operator()<cursor_on>() == collect.template operator()<cursor_off>());
+   };
+
+   "cursor_ignores_under_consuming_reader"_test = [] {
+      // FirstOfPair stops on an interior comma. That looks exactly like a legitimate element
+      // boundary from the outside, so the extent has to be rejected when it is recorded rather
+      // than when it is used.
+      auto collect = []<auto Opts>() {
+         const std::string_view src{"[[1,20],[3,40],[5,60]]"};
+         auto doc = glz::lazy_json<Opts>(src);
+         std::string out;
+         int guard{};
+         for (auto& e : doc->root()) {
+            FirstOfPair f{};
+            out += e.read_into(f) ? "!" : std::to_string(f.v);
+            out += ' ';
+            if (++guard > 8) break;
+         }
+         return out;
+      };
+
+      expect(collect.template operator()<cursor_on>() == "1 3 5 ");
+      expect(collect.template operator()<cursor_on>() == collect.template operator()<cursor_off>());
+   };
+
+   "cursor_scalar_elements_iterate_correctly"_test = [&] {
+      // Scalars are deliberately never recorded, so this exercises the un-accelerated path
+      // through the same loop.
+      const std::string json = R"({"rows":[1,"two",3.5,true,null,-6]})";
+      auto walk = []<auto Opts>(std::string_view j) {
+         auto doc = glz::lazy_json<Opts>(j);
+         std::string out;
+         for (auto& e : (*doc)["rows"]) {
+            out += e.raw_json();
+            out += '|';
+         }
+         return out;
+      };
+      expect(walk.template operator()<cursor_on>(json) == R"(1|"two"|3.5|true|null|-6|)");
+      expect(walk.template operator()<cursor_on>(json) == walk.template operator()<cursor_off>(json));
+   };
+
+   "cursor_malformed_input_matches_uncursored"_test = [] {
+      // The cursor must stay a pure speed difference on input that is not well formed, where the
+      // parser and the structural skip can disagree about where a token ends.
+      const std::vector<std::string> broken{
+         R"({"rows":[0-1,2]})",       R"({"rows":[1e,2]})",  R"({"rows":[--,3]})",
+         R"({"rows":[1,2)",           R"({"rows":[[1,2],3)", R"({"rows":[{"a":1},{"a":)",
+         R"({"rows":[{"a":1},{"b":)", R"({"rows":[")",       R"({"rows":[{)",
+      };
+
+      auto walk = []<auto Opts>(std::string_view j) {
+         auto doc = glz::lazy_json<Opts>(j);
+         if (not doc) return std::string{"<parse-error>"};
+         std::string out;
+         int guard{};
+         for (auto& e : (*doc)["rows"]) {
+            double v{};
+            out += e.read_into(v) ? "!" : std::to_string(v);
+            out += ';';
+            if (++guard > 32) return out + "<runaway>";
+         }
+         return out;
+      };
+
+      for (const auto& j : broken) {
+         expect(walk.template operator()<cursor_on>(j) == walk.template operator()<cursor_off>(j)) << j;
+      }
+   };
+
+   "cursor_truncated_container_matches_uncursored"_test = [] {
+      // An unclosed container never reaches its close bracket, so no container extent is
+      // published. Bounded buffers only, since that is the mode with no sentinel to stop on.
+      const std::vector<std::string> truncated{
+         R"({"rows":[[1,2],[3)",
+         R"({"rows":[{"a":1},{"a")",
+         R"({"rows":[[[)",
+         R"({"rows":[[1],)",
+      };
+
+      auto walk = []<auto Opts>(std::string_view j) {
+         auto doc = glz::lazy_json<Opts>(j);
+         if (not doc) return std::string{"<parse-error>"};
+         std::string out;
+         int guard{};
+         for (auto& e : (*doc)["rows"]) {
+            out += e.raw_json();
+            out += '|';
+            if (++guard > 32) return out + "<runaway>";
+         }
+         return out;
+      };
+
+      for (const auto& j : truncated) {
+         const std::string_view bounded{j.data(), j.size()};
+         expect(walk.template operator()<cursor_on_bounded>(bounded) ==
+                walk.template operator()<cursor_off_bounded>(bounded))
+            << j;
+      }
+   };
+
+   "cursor_disabled_costs_nothing"_test = [] {
+      // The disabled slot is an empty type under GLZ_NO_UNIQUE_ADDRESS, so opting out must not
+      // grow lazy_document at all.
+      expect(sizeof(glz::lazy_document<cursor_off>) == sizeof(glz::lazy_document<glz::opts{}>));
+      expect(sizeof(glz::lazy_document<cursor_on>) > sizeof(glz::lazy_document<cursor_off>));
+   };
+};
+
+// ============================================================================
+// Wide number skip (lazy_wide_number_skip)
+// ============================================================================
+
+// Renders a full traversal of {"a":[ ... ]} so both option settings can be compared exactly.
+// Elements are rendered by raw_json() so container elements and scalars alike are covered, and
+// any misplaced skip shows up as a shifted or truncated slice rather than a silent miscount.
+template <auto Opts>
+std::string traverse_raw(std::string_view json)
+{
+   auto doc = glz::lazy_json<Opts>(json);
+   if (not doc) return "<parse-error>";
+   std::string out;
+   for (auto& e : (*doc)["a"]) {
+      out += e.raw_json();
+      out += '|';
+   }
+   return out;
+}
+
+suite find_first_of_tests = [] {
+   // glz::find_first_of is a shared SWAR primitive, so it is worth pinning down directly rather
+   // than only through its caller. The 8-byte chunking means the interesting cases are matches
+   // straddling a chunk boundary and inputs shorter than one chunk.
+   auto at = [](std::string_view s) {
+      return glz::find_first_of<'"', '[', ']', '{', '}'>(s.data(), s.data() + s.size()) - s.data();
+   };
+
+   "find_first_of_basic"_test = [&] {
+      expect(at("") == 0);
+      expect(at("abc") == 3); // no match: lands on end
+      expect(at("[abc") == 0); // match at the very start
+      expect(at("abc]") == 3); // match at the very end
+      expect(at("ab\"cd") == 2);
+   };
+
+   "find_first_of_chunk_boundaries"_test = [&] {
+      // Byte 7 is the last of the first chunk, byte 8 the first of the second.
+      expect(at("0123456{") == 7);
+      expect(at("01234567{") == 8);
+      expect(at("0123456789012345}") == 16);
+      expect(at(std::string(64, 'x') + "]") == 64);
+      expect(at(std::string(64, 'x')) == 64); // no match across many chunks
+   };
+
+   "find_first_of_picks_earliest"_test = [&] {
+      // Several matches inside one chunk must resolve to the first, not merely any.
+      expect(at("ab[cd]ef") == 2);
+      expect(at("]]]]") == 0);
+      expect(at("0123456[]{}") == 7);
+   };
+
+   "find_first_of_does_not_overrun"_test = [&] {
+      // A match sitting just past the end must not be seen.
+      const std::string backing = "abcdefghijkl]";
+      const std::string_view bounded{backing.data(), backing.size() - 1};
+      expect(at(bounded) == std::ptrdiff_t(bounded.size()));
+   };
+};
+
+suite lazy_wide_number_skip_tests = [] {
+   // The escalation threshold is 8 bytes into a numeric run, so the interesting cases sit either
+   // side of it and exactly on it. numeric_table also accepts . + - e E, so runs are not just
+   // digits.
+   const std::vector<std::string> shapes{
+      R"({"a":[1,2,3]})", // shorter than the threshold
+      R"({"a":[1234567,12345678,123456789]})", // 7, 8 and 9 bytes: straddles the boundary
+      R"({"a":[1234567890123456789012345678901234567890]})", // far past it
+      R"({"a":[-1.5e-10,+2.25E+30,-0.000000000001]})", // full numeric alphabet
+      R"({"a":[[1234567890123,2345678901234],[3456789012345]]})", // runs nested in containers
+      R"({"a":[{"n":1234567890123,"m":2},{"n":3,"m":4567890123456}]})", // runs inside objects
+      // The skip escalates 8 bytes into a run, so a run of exactly 9 digits ends the moment it
+      // escalates. Only a container element routes through that code, and only a closing bracket
+      // (rather than a comma) is lost if the escalated scan starts one byte late - so these are
+      // the shapes where an off-by-one at the boundary actually changes the parse.
+      R"({"a":[[123456789],[1],[12345678],[1234567890]]})",
+      R"({"a":[{"n":123456789},{"n":12345678},{"n":1234567890}]})",
+      R"({"a":[[[123456789]],[[12345678]]]})", // boundary at two levels of nesting
+      // A long run immediately before each kind of structural byte. Runs followed only by a
+      // closing bracket cannot tell whether the scan still stops at '"', '[' and '{', so this
+      // puts a string, a nested array and a nested object directly after long numbers - and the
+      // string carries ']' and '}' so a scan that ignored quotes would miscount depth.
+      R"({"a":[[1234567890123,"s]}",1234567890124,[7],1234567890125,{"k":1}],9]})",
+      R"({"a":[1,"a string, with ] and } inside",2345678901234,true,null])", // mixed with strings
+      R"({"a":[]})", // empty
+   };
+
+   "wide_number_skip_matches_disabled"_test = [&] {
+      for (const auto& json : shapes) {
+         const auto on = traverse_raw<wide_num_on>(json);
+         const auto off = traverse_raw<wide_num_off>(json);
+         expect(on == off) << json;
+      }
+   };
+
+   "wide_number_skip_values_are_correct"_test = [&] {
+      expect(traverse_raw<wide_num_on>(shapes[1]) == "1234567|12345678|123456789|");
+      expect(traverse_raw<wide_num_on>(shapes[3]) == "-1.5e-10|+2.25E+30|-0.000000000001|");
+      expect(traverse_raw<wide_num_on>(shapes[4]) == "[1234567890123,2345678901234]|[3456789012345]|");
+      expect(traverse_raw<wide_num_on>(shapes[6]) == "[123456789]|[1]|[12345678]|[1234567890]|");
+      expect(traverse_raw<wide_num_on>(shapes[7]) == R"({"n":123456789}|{"n":12345678}|{"n":1234567890}|)");
+      expect(traverse_raw<wide_num_on>(shapes[8]) == "[[123456789]]|[[12345678]]|");
+      expect(traverse_raw<wide_num_on>(shapes[9]) ==
+             R"([1234567890123,"s]}",1234567890124,[7],1234567890125,{"k":1}]|9|)");
+      expect(traverse_raw<wide_num_on>(shapes[10]) == R"(1|"a string, with ] and } inside"|2345678901234|true|null|)");
+   };
+
+   "wide_number_skip_reads_agree"_test = [&] {
+      // The skip feeds iteration, so read_into over a long-run document must land on the same
+      // elements with the option on as with it off.
+      std::string json = R"({"a":[)";
+      for (int i = 0; i < 64; ++i) {
+         if (i) json += ',';
+         json += std::to_string(1234567890123456LL + i);
+      }
+      json += "]}";
+
+      auto sum = []<auto Opts>(std::string_view j) {
+         auto doc = glz::lazy_json<Opts>(j);
+         int64_t total{};
+         int count{};
+         for (auto& e : (*doc)["a"]) {
+            int64_t v{};
+            if (not e.read_into(v)) total += v;
+            if (++count > 128) break;
+         }
+         return std::pair{total, count};
+      };
+
+      const auto on = sum.template operator()<wide_num_on>(json);
+      const auto off = sum.template operator()<wide_num_off>(json);
+      expect(on == off);
+      expect(on.second == 64);
+   };
+
+   "wide_number_skip_respects_buffer_end"_test = [&] {
+      // A long run butted right up against the logical end, with a numeric tail past it. If the
+      // scan overran json_end() it would swallow the tail and change the last element.
+      std::string backing = R"({"a":[1,123456789012345678901234567890]}99999999999999999999)";
+      const std::string_view json{backing.data(), backing.find("]}") + 2};
+
+      expect(traverse_raw<wide_num_on>(json) == traverse_raw<wide_num_off>(json));
+      expect(traverse_raw<wide_num_on>(json) == "1|123456789012345678901234567890|");
+   };
+
+   "wide_number_skip_truncated_input_terminates"_test = [&] {
+      // Truncated mid-number: both settings must stop rather than run off the end.
+      std::string backing = R"({"a":[1,12345678901234567890)";
+      const std::string_view json{backing.data(), backing.size()};
+
+      const auto on = traverse_raw<wide_num_on>(json);
+      const auto off = traverse_raw<wide_num_off>(json);
+      expect(on == off);
+   };
+};
+
+// The shapes every writer test runs over. Each string is a complete document, so writing its
+// root must reproduce it byte for byte.
+inline const std::vector<std::string> writer_shapes{
+   R"({"a":1,"b":2})",
+   R"({"rows":[{"id":1,"tags":["x","y"]},{"id":2,"tags":[]}]})",
+   R"([1,2,3])",
+   R"([])",
+   R"({})",
+   R"([[[1]]])",
+   R"({"s":"has \"escapes\" and \\ backslashes"})",
+   R"("plain string")",
+   R"(1234567890123)",
+   R"(-4.25e-11)",
+   R"(true)",
+   R"(false)",
+   R"(null)",
+   R"(0)",
+};
+
+// validate_skipped routes skip_value down its validating path, which the writer must not
+// undermine when it settles a scalar sitting at the document edge.
+struct validating_bounded_opts : glz::opts
+{
+   bool null_terminated = false;
+   bool validate_skipped = true;
+};
+
+inline constexpr validating_bounded_opts validating_bounded{};
+
+// A document held in an exactly-sized heap allocation: no '\0' sentinel, and a sanitizer
+// redzone immediately after the last byte. Any read past json_end() trips ASAN here, which is
+// what makes these tests a memory-safety guard rather than only a behavior check.
+struct exact_buffer
+{
+   std::vector<char> bytes{};
+
+   explicit exact_buffer(std::string_view doc, std::string_view trailing = {})
+   {
+      bytes.reserve(doc.size() + trailing.size());
+      bytes.insert(bytes.end(), doc.begin(), doc.end());
+      bytes.insert(bytes.end(), trailing.begin(), trailing.end());
+      bytes.shrink_to_fit();
+   }
+
+   // Deliberately excludes `trailing`: the writer must never reach past this.
+   [[nodiscard]] std::string_view window(size_t n) const { return {bytes.data(), n}; }
+};
+
+suite lazy_writer_bounds_tests = [] {
+   "write_bounded_stays_inside_the_window"_test = [] {
+      // The regression this suite exists for: the writer skipped with a default-constructed
+      // `opts{}`, whose null_terminated = true made it scan past json_end() for a sentinel that
+      // a bounded buffer does not have. Scalars were the reachable case -- `42` was written out
+      // as `429187` when those digits happened to follow in memory.
+      for (const auto& doc : writer_shapes) {
+         const exact_buffer buf{doc, "9187SECRET_TOKEN"};
+         auto d = glz::lazy_json<cursor_off_bounded>(buf.window(doc.size()));
+         expect(d.has_value()) << doc;
+         if (not d) continue;
+
+         std::string out{};
+         expect(not glz::write_json(d->root(), out)) << doc;
+         expect(out == doc) << doc << " wrote " << out;
+      }
+   };
+
+   "write_bounded_matches_null_terminated"_test = [] {
+      // Bounded and null-terminated documents describe the same value, so the writer must not
+      // be able to tell them apart. This is the property that keeps the two skip paths honest.
+      for (const auto& doc : writer_shapes) {
+         const exact_buffer buf{doc};
+
+         std::string bounded_out{};
+         auto bounded_doc = glz::lazy_json<cursor_off_bounded>(buf.window(doc.size()));
+         expect(bounded_doc.has_value()) << doc;
+         const auto bounded_ec = glz::write_json(bounded_doc->root(), bounded_out);
+
+         std::string terminated_out{};
+         auto terminated_doc = glz::lazy_json<glz::opts{}>(doc);
+         expect(terminated_doc.has_value()) << doc;
+         const auto terminated_ec = glz::write_json(terminated_doc->root(), terminated_out);
+
+         expect(bounded_ec.ec == terminated_ec.ec) << doc;
+         expect(bounded_out == terminated_out) << doc;
+      }
+   };
+
+   "write_matches_raw_json"_test = [] {
+      // raw_json() and the writer are two implementations of "the bytes of this value". They
+      // are reached through different skips, so they are only equal if both agree on the extent
+      // -- including for a scalar sitting at the very end of the buffer.
+      for (const auto& doc : writer_shapes) {
+         const exact_buffer buf{doc};
+         auto d = glz::lazy_json<cursor_off_bounded>(buf.window(doc.size()));
+         expect(d.has_value()) << doc;
+         if (not d) continue;
+
+         std::string out{};
+         expect(not glz::write_json(d->root(), out)) << doc;
+         expect(out == d->root().raw_json()) << doc;
+      }
+   };
+
+   "write_nested_view_stops_at_its_own_end"_test = [] {
+      // A nested view's json_end() is the whole document's end, so an element that over-skips
+      // swallows its siblings instead of running off the buffer. Bounded and terminated modes
+      // must both stop at the element.
+      const std::string doc = R"({"a":[1,2],"b":"tail","c":{"d":3},"e":42})";
+      const exact_buffer buf{doc};
+
+      auto check = [&]<auto Opts>(std::string_view json) {
+         auto d = glz::lazy_json<Opts>(json);
+         expect(d.has_value());
+         if (not d) return;
+         const std::vector<std::pair<const char*, const char*>> expected{
+            {"a", "[1,2]"}, {"b", R"("tail")"}, {"c", R"({"d":3})"}, {"e", "42"}};
+         for (const auto& [key, want] : expected) {
+            std::string out{};
+            expect(not glz::write_json((*d)[key], out)) << key;
+            expect(out == want) << key << " wrote " << out;
+         }
+      };
+
+      check.template operator()<cursor_off_bounded>(buf.window(doc.size()));
+      check.template operator()<glz::opts{}>(doc);
+   };
+
+   "write_truncated_container_still_errors"_test = [] {
+      // Settling a scalar at the document edge must not settle a container or string that never
+      // reached its terminator: those are genuinely truncated and the writer has to say so.
+      const std::vector<std::string> truncated{
+         R"({"a":1)", R"([1,2)", R"("unterminated)", R"({"a":[1,)", R"([{"a")",
+      };
+
+      for (const auto& doc : truncated) {
+         const exact_buffer buf{doc, "SECRET_TOKEN"};
+         auto d = glz::lazy_json<cursor_off_bounded>(buf.window(doc.size()));
+         if (not d) continue; // rejected at construction is also a refusal
+         std::string out{};
+         expect(bool(glz::write_json(d->root(), out).ec)) << doc << " wrote " << out;
+      }
+   };
+
+   "write_never_succeeds_without_writing"_test = [] {
+      // Navigation to a key with no value leaves the view on the closing brace, where the skip
+      // consumes nothing. Emitting zero bytes and reporting success would splice invalid JSON
+      // into whatever the caller is building, so the writer has to refuse.
+      const std::string doc = R"({"a":})";
+      const exact_buffer buf{doc};
+
+      auto check = [&]<auto Opts>(std::string_view json) {
+         auto d = glz::lazy_json<Opts>(json);
+         if (not d) return; // rejecting the document outright is also a refusal
+         std::string out{};
+         const auto ec = glz::write_json((*d)["a"], out);
+         // Reporting success here is the failure mode: glz::write only truncates the buffer to
+         // the bytes written once the write succeeds, so a zero-byte success is an empty value
+         // the caller would go on to treat as JSON.
+         expect(bool(ec.ec));
+         expect(ec.ec != glz::error_code::none);
+      };
+
+      check.template operator()<cursor_off_bounded>(buf.window(doc.size()));
+      check.template operator()<glz::opts{}>(doc);
+   };
+
+   "write_settle_does_not_weaken_validate_skipped"_test = [] {
+      // The settle keys off unexpected_end, which is what skip_value reports when it simply runs
+      // out of bytes. A caller who opted into validate_skipped gets syntax_error for a malformed
+      // scalar instead, so the settle never sees it and their validation still holds.
+      // Only inputs the validating skip actually rejects. "01" is not one of them: skip_number
+      // stops cleanly after the leading zero, so the view is a complete "0" with trailing bytes
+      // the lazy API never claims to check.
+      const std::vector<std::string> malformed{"1.2e", "tru", "nul", "+5"};
+      for (const auto& doc : malformed) {
+         const exact_buffer buf{doc};
+         auto d = glz::lazy_json<validating_bounded>(buf.window(doc.size()));
+         if (not d) continue;
+         std::string out{};
+         expect(bool(glz::write_json(d->root(), out).ec)) << doc << " wrote " << out;
+      }
+
+      // Well-formed scalars at the document edge still write under the same options.
+      for (const auto& doc : {std::string{"42"}, std::string{"true"}, std::string{"-4.25e-11"}}) {
+         const exact_buffer buf{doc};
+         auto d = glz::lazy_json<validating_bounded>(buf.window(doc.size()));
+         expect(d.has_value()) << doc;
+         if (not d) continue;
+         std::string out{};
+         expect(not glz::write_json(d->root(), out)) << doc;
+         expect(out == doc) << doc << " wrote " << out;
+      }
+   };
+
+   "write_respects_derived_opts"_test = [] {
+      // The writer skips under the document's own options. Instantiating on a derived struct
+      // must compile and behave, which it cannot if the option pack is sliced back to glz::opts.
+      const std::string doc = R"({"a":[1,2,3]})";
+      const exact_buffer buf{doc};
+      auto d = glz::lazy_json<cursor_on_bounded>(buf.window(doc.size()));
+      expect(d.has_value());
+      std::string out{};
+      expect(not glz::write_json(d->root(), out));
+      expect(out == doc) << out;
    };
 };
 

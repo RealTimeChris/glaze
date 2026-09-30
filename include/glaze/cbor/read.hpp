@@ -10,6 +10,7 @@
 #include "glaze/core/read.hpp"
 #include "glaze/core/reflect.hpp"
 #include "glaze/file/file_ops.hpp"
+#include "glaze/json/generic_fwd.hpp"
 #include "glaze/util/dump.hpp"
 #include "glaze/util/for_each.hpp"
 
@@ -45,7 +46,7 @@ namespace glz
             return val;
          }
          case info::uint16_follows: {
-            if ((it + 2) > end) [[unlikely]] {
+            if ((end - it) < 2) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return 0;
             }
@@ -58,7 +59,7 @@ namespace glz
             return val;
          }
          case info::uint32_follows: {
-            if ((it + 4) > end) [[unlikely]] {
+            if ((end - it) < 4) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return 0;
             }
@@ -71,7 +72,7 @@ namespace glz
             return val;
          }
          case info::uint64_follows: {
-            if ((it + 8) > end) [[unlikely]] {
+            if ((end - it) < 8) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return 0;
             }
@@ -86,6 +87,36 @@ namespace glz
          default:
             ctx.error = error_code::syntax_error;
             return 0;
+         }
+      }
+
+      // Byteswap one typed-array element in place. An RFC 8746 tag names the producer's endianness,
+      // so an element whose tag disagrees with this platform is swapped through its bit pattern:
+      // V may be a floating point type, which has no byteswap of its own.
+      //
+      // Only the widths RFC 8746 defines below binary128 are handled. A one-byte element has no
+      // endianness, and a wider one reaches here only if typed_array::matches accepted its tag, which
+      // it does not do for binary128 -- so the widths left unhandled are the widths never passed in.
+      template <class V>
+      GLZ_ALWAYS_INLINE void byteswap_element(V& elem) noexcept
+      {
+         if constexpr (sizeof(V) == 2) {
+            uint16_t bits;
+            std::memcpy(&bits, &elem, sizeof(V));
+            bits = std::byteswap(bits);
+            std::memcpy(&elem, &bits, sizeof(V));
+         }
+         else if constexpr (sizeof(V) == 4) {
+            uint32_t bits;
+            std::memcpy(&bits, &elem, sizeof(V));
+            bits = std::byteswap(bits);
+            std::memcpy(&elem, &bits, sizeof(V));
+         }
+         else if constexpr (sizeof(V) == 8) {
+            uint64_t bits;
+            std::memcpy(&bits, &elem, sizeof(V));
+            bits = std::byteswap(bits);
+            std::memcpy(&elem, &bits, sizeof(V));
          }
       }
    }
@@ -276,8 +307,11 @@ namespace glz
    template <boolean_like T>
    struct from<CBOR, T>
    {
+      // A forwarding reference, not auto&: an element of std::vector<bool> is reached through a proxy
+      // that its container hands back by value, so binding the target as an lvalue reference would
+      // reject every bool that lives in one. The other formats' boolean readers take it the same way.
       template <auto Opts>
-      GLZ_ALWAYS_INLINE static void op(auto& value, is_context auto& ctx, auto& it, auto end) noexcept
+      GLZ_ALWAYS_INLINE static void op(auto&& value, is_context auto& ctx, auto& it, auto end) noexcept
       {
          using namespace cbor;
 
@@ -332,6 +366,14 @@ namespace glz
          uint64_t result = cbor_detail::decode_arg(ctx, it, end, additional_info);
          if (bool(ctx.error)) [[unlikely]]
             return;
+
+         // Reject a value that does not fit in T, matching the signed reader below and the
+         // JSON/MessagePack integer readers. Without this a uint16/uint32/uint64 argument is
+         // silently truncated into a narrower target (e.g. 300 -> uint8_t 44) with success.
+         if (result > static_cast<uint64_t>((std::numeric_limits<T>::max)())) [[unlikely]] {
+            ctx.error = error_code::parse_number_failure;
+            return;
+         }
 
          value = static_cast<T>(result);
       }
@@ -417,6 +459,27 @@ namespace glz
          const uint8_t major_type = get_major_type(initial);
          const uint8_t additional_info = get_additional_info(initial);
 
+         // An integer is a number, and a floating point target is the only alternative wide enough to
+         // hold a magnitude past int64_t. Rejecting the integer major types here left a CBOR integer
+         // too large for any integer target with nowhere to go, and matches what MessagePack's
+         // floating point reader has always accepted. It is a conversion, though: variant resolution
+         // runs a strict pass first so `double` cannot claim a value a later integer alternative
+         // holds exactly.
+         if (check_allow_conversions(Opts) && (major_type == major::uint || major_type == major::nint)) {
+            const uint64_t arg = cbor_detail::decode_arg(ctx, it, end, additional_info);
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+            if (major_type == major::nint) {
+               // A negative head encodes -1 - arg, which runs past int64_t once arg does.
+               value = static_cast<T>(-1.0 - static_cast<double>(arg));
+            }
+            else {
+               value = static_cast<T>(arg);
+            }
+            return;
+         }
+
          if (major_type != major::simple) [[unlikely]] {
             ctx.error = error_code::syntax_error;
             return;
@@ -424,7 +487,7 @@ namespace glz
 
          switch (additional_info) {
          case simple::float16: {
-            if ((it + 2) > end) [[unlikely]] {
+            if ((end - it) < 2) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return;
             }
@@ -438,7 +501,7 @@ namespace glz
             break;
          }
          case simple::float32: {
-            if ((it + 4) > end) [[unlikely]] {
+            if ((end - it) < 4) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return;
             }
@@ -454,19 +517,27 @@ namespace glz
             break;
          }
          case simple::float64: {
-            if ((it + 8) > end) [[unlikely]] {
-               ctx.error = error_code::unexpected_end;
-               return;
+            if constexpr (sizeof(T) < sizeof(double) && not check_allow_conversions(Opts)) {
+               // Narrowing a float64 rounds it, so without allow_conversions a narrower target rejects
+               // one. Variant resolution relies on this: a `float` alternative must not claim a value
+               // a later `double` alternative holds exactly.
+               ctx.error = error_code::syntax_error;
             }
-            uint64_t bits;
-            std::memcpy(&bits, it, 8);
-            if constexpr (std::endian::native == std::endian::little) {
-               bits = std::byteswap(bits);
+            else {
+               if ((end - it) < 8) [[unlikely]] {
+                  ctx.error = error_code::unexpected_end;
+                  return;
+               }
+               uint64_t bits;
+               std::memcpy(&bits, it, 8);
+               if constexpr (std::endian::native == std::endian::little) {
+                  bits = std::byteswap(bits);
+               }
+               double d;
+               std::memcpy(&d, &bits, 8);
+               it += 8;
+               value = static_cast<T>(d);
             }
-            double d;
-            std::memcpy(&d, &bits, 8);
-            it += 8;
-            value = static_cast<T>(d);
             break;
          }
          default:
@@ -629,6 +700,134 @@ namespace glz
       requires(contiguous_byte_range<std::remove_cvref_t<T>> && !str_t<T>)
    struct from<CBOR, T>
    {
+      // The same bytes are also legitimately carried as a plain array of small unsigned integers
+      // (major type 4). That is what a non-contiguous byte range such as std::list<uint8_t> writes,
+      // and what CBOR producers that treat a byte sequence as an array of numbers emit, so read
+      // either encoding into the same target. The initial byte has already been consumed.
+      template <auto Opts>
+      static void read_as_array(auto& value, is_context auto& ctx, auto& it, auto end, const uint8_t additional_info)
+      {
+         using namespace cbor;
+
+         depth_guard guard{ctx};
+         if (!guard) [[unlikely]] {
+            return;
+         }
+
+         // Grow to i + 1 elements, or bounds-check a fixed-size target. Returns false on failure.
+         const auto make_room = [&](const size_t i) {
+            if constexpr (resizable<T>) {
+               if (exceeds_capacity(value, i + 1, ctx)) [[unlikely]] {
+                  return false;
+               }
+               value.resize(i + 1);
+            }
+            else {
+               if (i >= value.size()) [[unlikely]] {
+                  ctx.error = error_code::exceeded_static_array_size;
+                  return false;
+               }
+            }
+            return true;
+         };
+
+         size_t count = 0;
+         if (additional_info == info::indefinite) {
+            if constexpr (resizable<T>) {
+               value.clear();
+            }
+            while (true) {
+               if (it >= end) [[unlikely]] {
+                  ctx.error = error_code::unexpected_end;
+                  return;
+               }
+
+               uint8_t peek;
+               std::memcpy(&peek, it, 1);
+               if (peek == initial_byte(major::simple, simple::break_code)) {
+                  ++it;
+                  break;
+               }
+
+               if constexpr (check_max_array_size(Opts) > 0) {
+                  if (count >= check_max_array_size(Opts)) [[unlikely]] {
+                     ctx.error = error_code::invalid_length;
+                     return;
+                  }
+               }
+               if constexpr (has_runtime_max_array_size<std::decay_t<decltype(ctx)>>) {
+                  if (ctx.max_array_size > 0 && count >= ctx.max_array_size) [[unlikely]] {
+                     ctx.error = error_code::invalid_length;
+                     return;
+                  }
+               }
+               if (!make_room(count)) [[unlikely]] {
+                  return;
+               }
+               // Reached through data() rather than a subscript: contiguous storage is what this
+               // reader relies on, and a contiguous range need not also be indexable. Re-read on
+               // every pass, since make_room grows a resizable target one element at a time and any
+               // pointer taken before that is stale.
+               parse<CBOR>::op<Opts>(value.data()[count], ctx, it, end);
+               if (bool(ctx.error)) [[unlikely]]
+                  return;
+               ++count;
+            }
+         }
+         else {
+            const uint64_t n = cbor_detail::decode_arg(ctx, it, end, additional_info);
+            if (bool(ctx.error)) [[unlikely]]
+               return;
+
+            // Every element occupies at least one byte, so a valid count cannot exceed the input.
+            if (n > static_cast<uint64_t>(end - it)) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return;
+            }
+            if constexpr (check_max_array_size(Opts) > 0) {
+               if (n > check_max_array_size(Opts)) [[unlikely]] {
+                  ctx.error = error_code::invalid_length;
+                  return;
+               }
+            }
+            if constexpr (has_runtime_max_array_size<std::decay_t<decltype(ctx)>>) {
+               if (ctx.max_array_size > 0 && n > ctx.max_array_size) [[unlikely]] {
+                  ctx.error = error_code::invalid_length;
+                  return;
+               }
+            }
+
+            if constexpr (resizable<T>) {
+               if (exceeds_capacity(value, static_cast<size_t>(n), ctx)) [[unlikely]] {
+                  return;
+               }
+               value.resize(static_cast<size_t>(n));
+            }
+            else {
+               if (n > value.size()) [[unlikely]] {
+                  ctx.error = error_code::exceeded_static_array_size;
+                  return;
+               }
+            }
+
+            // As above, through data() rather than a subscript. The target reached its full size
+            // before the loop, so one pointer serves the whole of it.
+            auto* dest = value.data();
+            for (; count < n; ++count) {
+               parse<CBOR>::op<Opts>(dest[count], ctx, it, end);
+               if (bool(ctx.error)) [[unlikely]]
+                  return;
+            }
+         }
+
+         if constexpr (!resizable<T>) {
+            // Zero-fill any unused tail, as the byte string path does.
+            if (count < value.size()) {
+               std::memset(value.data() + count, 0, value.size() - count);
+            }
+         }
+      }
+
       template <auto Opts>
       static void op(auto& value, is_context auto& ctx, auto& it, auto end)
       {
@@ -646,6 +845,11 @@ namespace glz
          const uint8_t major_type = get_major_type(initial);
          const uint8_t additional_info = get_additional_info(initial);
 
+         if (major_type == major::array) {
+            read_as_array<Opts>(value, ctx, it, end, additional_info);
+            return;
+         }
+
          if (major_type != major::bstr) [[unlikely]] {
             ctx.error = error_code::syntax_error;
             return;
@@ -657,6 +861,7 @@ namespace glz
                value.clear();
             }
             size_t offset = 0; // fill position for fixed-size targets
+            uint64_t total = 0; // bytes accumulated so far, across chunks
             while (true) {
                if (it >= end) [[unlikely]] {
                   ctx.error = error_code::unexpected_end;
@@ -693,10 +898,31 @@ namespace glz
                   return;
                }
 
+               // A break code rather than a length ends this byte string, so the caller's limit is
+               // enforced against the running total instead of a single header.
+               total += chunk_len;
+               if constexpr (check_max_array_size(Opts) > 0) {
+                  if (total > check_max_array_size(Opts)) [[unlikely]] {
+                     ctx.error = error_code::invalid_length;
+                     return;
+                  }
+               }
+               if constexpr (has_runtime_max_array_size<std::decay_t<decltype(ctx)>>) {
+                  if (ctx.max_array_size > 0 && total > ctx.max_array_size) [[unlikely]] {
+                     ctx.error = error_code::invalid_length;
+                     return;
+                  }
+               }
+
                if constexpr (resizable<T>) {
                   const size_t old_size = value.size();
+                  if (exceeds_capacity(value, old_size + static_cast<size_t>(chunk_len), ctx)) [[unlikely]] {
+                     return;
+                  }
                   value.resize(old_size + static_cast<size_t>(chunk_len));
-                  std::memcpy(value.data() + old_size, it, chunk_len);
+                  if (chunk_len > 0) {
+                     std::memcpy(value.data() + old_size, it, chunk_len);
+                  }
                }
                else {
                   // Fixed-size std::array<std::byte, N>: accumulate with bounds checking.
@@ -741,8 +967,13 @@ namespace glz
             }
 
             if constexpr (resizable<T>) {
+               if (exceeds_capacity(value, static_cast<size_t>(length), ctx)) [[unlikely]] {
+                  return;
+               }
                value.resize(static_cast<size_t>(length));
-               std::memcpy(value.data(), it, length);
+               if (length > 0) {
+                  std::memcpy(value.data(), it, length);
+               }
             }
             else {
                // Fixed-size std::array<std::byte, N>: bounds-check, copy, zero-fill remainder.
@@ -768,11 +999,99 @@ namespace glz
       requires(!eigen_t<T> && !contiguous_byte_range<std::remove_cvref_t<T>>)
    struct from<CBOR, T> final
    {
+      // A sequence of bytes is also legitimately carried as a CBOR byte string (major type 2). That
+      // is what a contiguous byte range such as std::vector<uint8_t> writes, so a byte-like range
+      // reads either encoding. `append` takes one decoded byte and returns false once the target is
+      // full; the initial byte has already been consumed.
+      template <auto Opts>
+      static void read_byte_string(is_context auto& ctx, auto& it, auto end, const uint8_t additional_info,
+                                   auto&& append)
+      {
+         using namespace cbor;
+
+         // An indefinite-length byte string is ended by a break code rather than a length, so the
+         // caller's limit is enforced against the running total rather than a single header.
+         uint64_t total = 0;
+
+         // Copy `length` bytes out of the input, having checked they are all present.
+         const auto take = [&](const uint64_t length) {
+            if (static_cast<uint64_t>(end - it) < length) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return false;
+            }
+            total += length;
+            if constexpr (check_max_array_size(Opts) > 0) {
+               if (total > check_max_array_size(Opts)) [[unlikely]] {
+                  ctx.error = error_code::invalid_length;
+                  return false;
+               }
+            }
+            if constexpr (has_runtime_max_array_size<std::decay_t<decltype(ctx)>>) {
+               if (ctx.max_array_size > 0 && total > ctx.max_array_size) [[unlikely]] {
+                  ctx.error = error_code::invalid_length;
+                  return false;
+               }
+            }
+            for (uint64_t i = 0; i < length; ++i, ++it) {
+               uint8_t byte;
+               std::memcpy(&byte, it, 1);
+               if (!append(byte)) [[unlikely]] {
+                  return false;
+               }
+            }
+            return true;
+         };
+
+         if (additional_info == info::indefinite) {
+            while (true) {
+               if (it >= end) [[unlikely]] {
+                  ctx.error = error_code::unexpected_end;
+                  return;
+               }
+
+               uint8_t chunk_initial;
+               std::memcpy(&chunk_initial, it, 1);
+               if (chunk_initial == initial_byte(major::simple, simple::break_code)) {
+                  ++it;
+                  return;
+               }
+
+               // Chunks of an indefinite-length byte string are themselves definite byte strings.
+               if (get_major_type(chunk_initial) != major::bstr ||
+                   get_additional_info(chunk_initial) == info::indefinite) [[unlikely]] {
+                  ctx.error = error_code::syntax_error;
+                  return;
+               }
+               ++it;
+
+               const uint64_t chunk_len = cbor_detail::decode_arg(ctx, it, end, get_additional_info(chunk_initial));
+               if (bool(ctx.error)) [[unlikely]]
+                  return;
+               if (!take(chunk_len)) [[unlikely]]
+                  return;
+            }
+         }
+
+         const uint64_t length = cbor_detail::decode_arg(ctx, it, end, additional_info);
+         if (bool(ctx.error)) [[unlikely]]
+            return;
+
+         (void)take(length);
+      }
+
       template <auto Opts>
       static void op(auto& value, is_context auto& ctx, auto& it, auto end)
       {
          using namespace cbor;
          using V = range_value_t<std::remove_cvref_t<T>>;
+
+         // Set-like containers (std::set, std::unordered_set, ...) can neither be resized nor
+         // back-inserted into: each element is parsed into a temporary and then emplaced.
+         constexpr bool set_like = !resizable<T> && !emplace_backable<T> && emplaceable<T>;
+         // Everything else either has a fixed size the input must fit, or grows to match the input.
+         // The definite- and indefinite-length branches below must agree on which is which, or the
+         // same container would accept one framing of an array and reject the other.
+         constexpr bool growable = resizable<T> || emplace_backable<T> || set_like;
 
          if (it >= end) [[unlikely]] {
             ctx.error = error_code::unexpected_end;
@@ -785,8 +1104,69 @@ namespace glz
          const uint8_t major_type = get_major_type(initial);
          const uint8_t additional_info = get_additional_info(initial);
 
+         // A byte-like range also accepts a CBOR byte string, which is what the contiguous byte
+         // ranges write for the same bytes.
+         if constexpr (byte_like<V>) {
+            if (major_type == major::bstr) {
+               ++it; // consume the initial byte
+
+               depth_guard guard{ctx};
+               if (!guard) [[unlikely]] {
+                  return;
+               }
+
+               if constexpr (growable) {
+                  value.clear();
+               }
+
+               size_t filled = 0;
+               // Only a target that cannot grow is filled in place; growing would invalidate this.
+               [[maybe_unused]] decltype(value.begin()) dest{};
+               if constexpr (not growable) {
+                  dest = value.begin();
+               }
+               read_byte_string<Opts>(ctx, it, end, additional_info, [&](const uint8_t byte) {
+                  if (exceeds_capacity(value, filled + 1, ctx)) [[unlikely]] {
+                     return false;
+                  }
+                  if constexpr (set_like) {
+                     value.emplace(static_cast<V>(byte));
+                  }
+                  else if constexpr (emplace_backable<T>) {
+                     value.emplace_back(static_cast<V>(byte));
+                  }
+                  else if constexpr (resizable<T>) {
+                     value.resize(filled + 1);
+                     auto slot = value.begin();
+                     std::advance(slot, filled);
+                     *slot = static_cast<V>(byte);
+                  }
+                  else {
+                     if (filled >= value.size()) [[unlikely]] {
+                        ctx.error = error_code::exceeded_static_array_size;
+                        return false;
+                     }
+                     *dest = static_cast<V>(byte);
+                     ++dest;
+                  }
+                  ++filled;
+                  return true;
+               });
+
+               if constexpr (!growable) {
+                  // Zero-fill any unused tail, as the byte string reader does for std::array.
+                  if (not bool(ctx.error)) {
+                     for (; filled < value.size(); ++filled, ++dest) {
+                        *dest = V{};
+                     }
+                  }
+               }
+               return;
+            }
+         }
+
          // Check for RFC 8746 typed array (tag + byte string)
-         if constexpr (num_t<V> && !std::same_as<V, bool> && contiguous<T>) {
+         if constexpr (num_t<V> && !std::same_as<V, bool>) {
             if (major_type == major::tag) {
                ++it; // consume the tag initial byte
 
@@ -795,9 +1175,8 @@ namespace glz
                if (bool(ctx.error)) [[unlikely]]
                   return;
 
-               // Verify it's a valid typed array tag for our element type
-               const auto ta_info = typed_array::get_info(tag_num);
-               if (ta_info.valid && ta_info.element_size == sizeof(V)) {
+               // Verify the tag describes exactly this element type, not merely one of its width
+               if (typed_array::matches<V>(typed_array::get_info(tag_num))) {
                   // Read the byte string
                   if (it >= end) [[unlikely]] {
                      ctx.error = error_code::unexpected_end;
@@ -843,10 +1222,28 @@ namespace glz
                      }
                   }
 
-                  if constexpr (resizable<T>) {
+                  if constexpr (set_like) {
+                     value.clear();
+                  }
+                  else if constexpr (resizable<T>) {
+                     if (exceeds_capacity(value, count, ctx)) [[unlikely]] {
+                        return;
+                     }
                      value.resize(count);
                      if constexpr (check_shrink_to_fit(Opts) && has_shrink_to_fit<T>) {
                         value.shrink_to_fit();
+                     }
+                  }
+                  else if constexpr (emplace_backable<T>) {
+                     // Append-only: the count is known, but the only way to reach it is one element at
+                     // a time. Growing to count here rather than while filling leaves both fill paths
+                     // below writing into storage that already exists.
+                     if (exceeds_capacity(value, count, ctx)) [[unlikely]] {
+                        return;
+                     }
+                     value.clear();
+                     for (size_t i = 0; i < count; ++i) {
+                        value.emplace_back();
                      }
                   }
                   else {
@@ -859,38 +1256,52 @@ namespace glz
                   // Check if we need to byteswap
                   const bool need_swap = typed_array::needs_byteswap(tag_num);
 
-                  if (need_swap && sizeof(V) > 1) {
-                     // Need to byteswap each element
-                     for (size_t i = 0; i < count; ++i) {
-                        V elem;
-                        std::memcpy(&elem, it, sizeof(V));
-                        if constexpr (sizeof(V) == 2) {
-                           uint16_t bits;
-                           std::memcpy(&bits, &elem, sizeof(V));
-                           bits = std::byteswap(bits);
-                           std::memcpy(&elem, &bits, sizeof(V));
+                  if constexpr (contiguous<T>) {
+                     if (need_swap && sizeof(V) > 1) {
+                        // Need to byteswap each element. Written through data() rather than a
+                        // subscript: contiguous storage is what this branch relies on, and a
+                        // contiguous range need not also be indexable.
+                        auto* dest = value.data();
+                        for (size_t i = 0; i < count; ++i) {
+                           V elem;
+                           std::memcpy(&elem, it, sizeof(V));
+                           cbor_detail::byteswap_element(elem);
+                           dest[i] = elem;
+                           it += sizeof(V);
                         }
-                        else if constexpr (sizeof(V) == 4) {
-                           uint32_t bits;
-                           std::memcpy(&bits, &elem, sizeof(V));
-                           bits = std::byteswap(bits);
-                           std::memcpy(&elem, &bits, sizeof(V));
+                     }
+                     else {
+                        // Native endianness or single-byte: bulk read
+                        if (byte_len > 0) {
+                           std::memcpy(value.data(), it, byte_len);
+                           it += byte_len;
                         }
-                        else if constexpr (sizeof(V) == 8) {
-                           uint64_t bits;
-                           std::memcpy(&bits, &elem, sizeof(V));
-                           bits = std::byteswap(bits);
-                           std::memcpy(&elem, &bits, sizeof(V));
-                        }
-                        value[i] = elem;
-                        it += sizeof(V);
                      }
                   }
                   else {
-                     // Native endianness or single-byte: bulk read
-                     if (byte_len > 0) {
-                        std::memcpy(value.data(), it, byte_len);
-                        it += byte_len;
+                     // std::list, std::set and friends have no contiguous storage to bulk read into,
+                     // so each element is decoded on its own.
+                     const bool swap_each = need_swap && sizeof(V) > 1;
+                     const auto next_element = [&] {
+                        V elem;
+                        std::memcpy(&elem, it, sizeof(V));
+                        if (swap_each) {
+                           cbor_detail::byteswap_element(elem);
+                        }
+                        it += sizeof(V);
+                        return elem;
+                     };
+
+                     if constexpr (set_like) {
+                        for (size_t i = 0; i < count; ++i) {
+                           value.emplace(next_element());
+                        }
+                     }
+                     else {
+                        auto dest = value.begin();
+                        for (size_t i = 0; i < count; ++i, ++dest) {
+                           *dest = next_element();
+                        }
                      }
                   }
                   return; // Done with typed array
@@ -904,7 +1315,7 @@ namespace glz
          }
 
          // Check for complex array (tag 43001 with nested typed array)
-         if constexpr (complex_t<V> && contiguous<T>) {
+         if constexpr (complex_t<V>) {
             if (major_type == major::tag) {
                ++it; // consume the tag initial byte
 
@@ -936,9 +1347,8 @@ namespace glz
                   if (bool(ctx.error)) [[unlikely]]
                      return;
 
-                  // Verify it's a valid typed array tag for the scalar type
-                  const auto ta_info = typed_array::get_info(scalar_tag);
-                  if (!ta_info.valid || ta_info.element_size != sizeof(Scalar)) [[unlikely]] {
+                  // Verify the tag describes exactly this scalar type, not merely one of its width
+                  if (!typed_array::matches<Scalar>(typed_array::get_info(scalar_tag))) [[unlikely]] {
                      ctx.error = error_code::syntax_error;
                      return;
                   }
@@ -990,10 +1400,27 @@ namespace glz
                      }
                   }
 
-                  if constexpr (resizable<T>) {
+                  if constexpr (set_like) {
+                     value.clear();
+                  }
+                  else if constexpr (resizable<T>) {
+                     if (exceeds_capacity(value, count, ctx)) [[unlikely]] {
+                        return;
+                     }
                      value.resize(count);
                      if constexpr (check_shrink_to_fit(Opts) && has_shrink_to_fit<T>) {
                         value.shrink_to_fit();
+                     }
+                  }
+                  else if constexpr (emplace_backable<T>) {
+                     // Append-only, as above: grow to the known count so the fill paths below only
+                     // have to write into elements that already exist.
+                     if (exceeds_capacity(value, count, ctx)) [[unlikely]] {
+                        return;
+                     }
+                     value.clear();
+                     for (size_t i = 0; i < count; ++i) {
+                        value.emplace_back();
                      }
                   }
                   else {
@@ -1006,40 +1433,52 @@ namespace glz
                   // Check if we need to byteswap
                   const bool need_swap = typed_array::needs_byteswap(scalar_tag);
 
-                  if (need_swap && sizeof(Scalar) > 1) {
-                     // Need to byteswap each scalar in the interleaved data
-                     auto* dest = reinterpret_cast<Scalar*>(value.data());
-                     const size_t num_scalars = count * 2; // 2 scalars per complex
-                     for (size_t i = 0; i < num_scalars; ++i) {
-                        Scalar elem;
-                        std::memcpy(&elem, it, sizeof(Scalar));
-                        if constexpr (sizeof(Scalar) == 2) {
-                           uint16_t bits;
-                           std::memcpy(&bits, &elem, sizeof(Scalar));
-                           bits = std::byteswap(bits);
-                           std::memcpy(&elem, &bits, sizeof(Scalar));
+                  if constexpr (contiguous<T>) {
+                     if (need_swap && sizeof(Scalar) > 1) {
+                        // Need to byteswap each scalar in the interleaved data
+                        auto* dest = reinterpret_cast<Scalar*>(value.data());
+                        const size_t num_scalars = count * 2; // 2 scalars per complex
+                        for (size_t i = 0; i < num_scalars; ++i) {
+                           Scalar elem;
+                           std::memcpy(&elem, it, sizeof(Scalar));
+                           cbor_detail::byteswap_element(elem);
+                           dest[i] = elem;
+                           it += sizeof(Scalar);
                         }
-                        else if constexpr (sizeof(Scalar) == 4) {
-                           uint32_t bits;
-                           std::memcpy(&bits, &elem, sizeof(Scalar));
-                           bits = std::byteswap(bits);
-                           std::memcpy(&elem, &bits, sizeof(Scalar));
+                     }
+                     else {
+                        // Native endianness or single-byte: bulk read
+                        if (byte_len > 0) {
+                           std::memcpy(value.data(), it, byte_len);
+                           it += byte_len;
                         }
-                        else if constexpr (sizeof(Scalar) == 8) {
-                           uint64_t bits;
-                           std::memcpy(&bits, &elem, sizeof(Scalar));
-                           bits = std::byteswap(bits);
-                           std::memcpy(&elem, &bits, sizeof(Scalar));
-                        }
-                        dest[i] = elem;
-                        it += sizeof(Scalar);
                      }
                   }
                   else {
-                     // Native endianness or single-byte: bulk read
-                     if (byte_len > 0) {
-                        std::memcpy(value.data(), it, byte_len);
-                        it += byte_len;
+                     // No contiguous storage to bulk read into, so the interleaved [real, imag] pairs
+                     // are reassembled one element at a time.
+                     const bool swap_each = need_swap && sizeof(Scalar) > 1;
+                     const auto next_element = [&] {
+                        Scalar parts[2];
+                        std::memcpy(parts, it, sizeof(V));
+                        if (swap_each) {
+                           cbor_detail::byteswap_element(parts[0]);
+                           cbor_detail::byteswap_element(parts[1]);
+                        }
+                        it += sizeof(V);
+                        return V{parts[0], parts[1]};
+                     };
+
+                     if constexpr (set_like) {
+                        for (size_t i = 0; i < count; ++i) {
+                           value.emplace(next_element());
+                        }
+                     }
+                     else {
+                        auto dest = value.begin();
+                        for (size_t i = 0; i < count; ++i, ++dest) {
+                           *dest = next_element();
+                        }
                      }
                   }
                   return; // Done with complex array
@@ -1067,9 +1506,17 @@ namespace glz
          }
 
          if (additional_info == info::indefinite) {
-            // Indefinite-length array
-            if constexpr (resizable<T>) {
+            // Indefinite-length array. The resizable-only path below grows with resize() from index
+            // zero, which drops any prior contents on its own, so it needs no clear() of its own.
+            if constexpr (emplace_backable<T> || set_like) {
                value.clear();
+            }
+            // A target that cannot grow is filled in place, and it is walked with an iterator rather
+            // than a subscript because a non-resizable range need not be indexable. The growing cases
+            // leave this default constructed: insertion would invalidate it.
+            [[maybe_unused]] decltype(value.begin()) dest{};
+            if constexpr (not growable) {
+               dest = value.begin();
             }
             size_t i = 0;
             while (true) {
@@ -1086,18 +1533,52 @@ namespace glz
                   break;
                }
 
-               if constexpr (resizable<T>) {
-                  value.emplace_back();
-                  parse<CBOR>::op<Opts>(value.back(), ctx, it, end);
+               // A break code rather than a count ends this array, so the caller's element limit is
+               // enforced as the array grows instead of up front.
+               if constexpr (check_max_array_size(Opts) > 0) {
+                  if (i >= check_max_array_size(Opts)) [[unlikely]] {
+                     ctx.error = error_code::invalid_length;
+                     return;
+                  }
+               }
+               if constexpr (has_runtime_max_array_size<std::decay_t<decltype(ctx)>>) {
+                  if (ctx.max_array_size > 0 && i >= ctx.max_array_size) [[unlikely]] {
+                     ctx.error = error_code::invalid_length;
+                     return;
+                  }
+               }
+
+               if (exceeds_capacity(value, i + 1, ctx)) [[unlikely]] {
+                  return;
+               }
+
+               if constexpr (emplace_backable<T>) {
+                  parse<CBOR>::op<Opts>(value.emplace_back(), ctx, it, end);
+               }
+               else if constexpr (set_like) {
+                  V element{};
+                  parse<CBOR>::op<Opts>(element, ctx, it, end);
+                  if (bool(ctx.error)) [[unlikely]]
+                     return;
+                  value.emplace(std::move(element));
+               }
+               else if constexpr (resizable<T>) {
+                  // Resizable but append-only through resize: grow by one and re-derive the write
+                  // position, since growing may invalidate any iterator held across it.
+                  value.resize(i + 1);
+                  auto slot = value.begin();
+                  std::advance(slot, i);
+                  parse<CBOR>::op<Opts>(*slot, ctx, it, end);
                }
                else {
                   if (i >= value.size()) [[unlikely]] {
                      ctx.error = error_code::exceeded_static_array_size;
                      return;
                   }
-                  parse<CBOR>::op<Opts>(value[i], ctx, it, end);
-                  ++i;
+                  parse<CBOR>::op<Opts>(*dest, ctx, it, end);
+                  ++dest;
                }
+               ++i;
 
                if (bool(ctx.error)) [[unlikely]]
                   return;
@@ -1129,24 +1610,53 @@ namespace glz
                }
             }
 
-            if constexpr (resizable<T>) {
-               value.resize(static_cast<size_t>(count));
-
-               if constexpr (check_shrink_to_fit(Opts) && has_shrink_to_fit<T>) {
-                  value.shrink_to_fit();
+            if constexpr (set_like) {
+               value.clear();
+               for (size_t i = 0; i < count; ++i) {
+                  V element{};
+                  parse<CBOR>::op<Opts>(element, ctx, it, end);
+                  if (bool(ctx.error)) [[unlikely]]
+                     return;
+                  value.emplace(std::move(element));
+               }
+            }
+            else if constexpr (emplace_backable<T> && !resizable<T>) {
+               // Append-only: there is no way to size the target up front even though the count is known.
+               if (exceeds_capacity(value, static_cast<size_t>(count), ctx)) [[unlikely]] {
+                  return;
+               }
+               value.clear();
+               for (size_t i = 0; i < count; ++i) {
+                  parse<CBOR>::op<Opts>(value.emplace_back(), ctx, it, end);
+                  if (bool(ctx.error)) [[unlikely]]
+                     return;
                }
             }
             else {
-               if (count > value.size()) [[unlikely]] {
-                  ctx.error = error_code::exceeded_static_array_size;
-                  return;
-               }
-            }
+               if constexpr (resizable<T>) {
+                  if (exceeds_capacity(value, static_cast<size_t>(count), ctx)) [[unlikely]] {
+                     return;
+                  }
+                  value.resize(static_cast<size_t>(count));
 
-            for (size_t i = 0; i < count; ++i) {
-               parse<CBOR>::op<Opts>(value[i], ctx, it, end);
-               if (bool(ctx.error)) [[unlikely]]
-                  return;
+                  if constexpr (check_shrink_to_fit(Opts) && has_shrink_to_fit<T>) {
+                     value.shrink_to_fit();
+                  }
+               }
+               else {
+                  if (count > value.size()) [[unlikely]] {
+                     ctx.error = error_code::exceeded_static_array_size;
+                     return;
+                  }
+               }
+
+               // Iteration rather than subscripting: std::list resizes but does not index.
+               auto dest = value.begin();
+               for (size_t i = 0; i < count; ++i, ++dest) {
+                  parse<CBOR>::op<Opts>(*dest, ctx, it, end);
+                  if (bool(ctx.error)) [[unlikely]]
+                     return;
+               }
             }
          }
       }
@@ -1306,11 +1816,28 @@ namespace glz
 #pragma warning(disable : 4702) // unreachable code from if constexpr
 #endif
    // Glaze objects (structs with reflection)
+   // TagKey names an internally tagged variant's discriminator, which the variant reader has already
+   // resolved. It appears in this object's map like any other key, so tolerate it: skip it unless the
+   // alternative declares a member of that name, in which case it reads normally into that member.
+   // Mirrors the JSON object reader's `string_literal tag` parameter.
    template <class T>
       requires((glaze_object_t<T> || reflectable<T>) && !custom_read<T>)
    struct from<CBOR, T> final
    {
-      template <auto Opts>
+      // True when `key` is the discriminator the variant reader already resolved. Folded away for an
+      // ordinary object read, where TagKey is empty.
+      template <string_literal TagKey>
+      static constexpr bool is_tag_key(const sv key) noexcept
+      {
+         if constexpr (TagKey.sv().empty()) {
+            return false;
+         }
+         else {
+            return key == TagKey.sv();
+         }
+      }
+
+      template <auto Opts, string_literal TagKey = "">
       static void op(auto& value, is_context auto& ctx, auto& it, auto end)
       {
          using namespace cbor;
@@ -1407,12 +1934,22 @@ namespace glz
                         static constexpr auto TargetKey = get<I>(reflect<T>::keys);
                         static constexpr auto Length = TargetKey.size();
                         if ((Length == key_len) && compare<Length>(TargetKey.data(), key.data())) [[likely]] {
-                           if constexpr (reflectable<T>) {
+                           // An `else` branch rather than an early return, so a skipped field's reader
+                           // is never instantiated -- see `skipped_by_meta`.
+                           if constexpr (skipped_by_meta<T, I, operation::parse>) {
+                              skip_value<CBOR>::op<Opts>(ctx, it, end);
+                           }
+                           else if constexpr (reflectable<T>) {
                               parse<CBOR>::op<Opts>(get_member(value, get<I>(to_tie(value))), ctx, it, end);
                            }
                            else {
                               parse<CBOR>::op<Opts>(get_member(value, get<I>(reflect<T>::values)), ctx, it, end);
                            }
+                        }
+                        else if (is_tag_key<TagKey>(key)) {
+                           skip_value<CBOR>::op<Opts>(ctx, it, end);
+                           if (bool(ctx.error)) [[unlikely]]
+                              return;
                         }
                         else {
                            if constexpr (Opts.error_on_unknown_keys) {
@@ -1432,7 +1969,14 @@ namespace glz
                      return;
                }
                else [[unlikely]] {
-                  if constexpr (Opts.error_on_unknown_keys) {
+                  const sv unmatched{reinterpret_cast<const char*>(it), static_cast<size_t>(key_len)};
+                  if (is_tag_key<TagKey>(unmatched)) {
+                     it += key_len;
+                     skip_value<CBOR>::op<Opts>(ctx, it, end);
+                     if (bool(ctx.error)) [[unlikely]]
+                        return;
+                  }
+                  else if constexpr (Opts.error_on_unknown_keys) {
                      ctx.error = error_code::unknown_key;
                      return;
                   }
@@ -1443,6 +1987,12 @@ namespace glz
                         return;
                   }
                }
+            }
+            else if (is_tag_key<TagKey>(sv{reinterpret_cast<const char*>(it), static_cast<size_t>(key_len)})) {
+               it += key_len;
+               skip_value<CBOR>::op<Opts>(ctx, it, end);
+               if (bool(ctx.error)) [[unlikely]]
+                  return;
             }
             else if constexpr (Opts.error_on_unknown_keys) {
                ctx.error = error_code::unknown_key;
@@ -1753,80 +2303,314 @@ namespace glz
    };
 
    // Variants
+   // The counterpart of to<CBOR, T>: the shape is whatever glz::meta declared, and an undeclared
+   // variant is a bare value resolved from CBOR's own major type.
    template <is_variant T>
       requires(not custom_read<T>)
    struct from<CBOR, T>
    {
+      static constexpr auto tagging = variant_tagging_v<T>;
+      static constexpr size_t variant_size = std::variant_size_v<T>;
+      static constexpr auto contested = binary_contested_alternatives_v<T>;
+
+      // One pass over the alternatives, rewinding after each miss.
+      // Every CBOR reader validates the major type it is handed, so a wrong alternative fails on the
+      // head byte rather than consuming input. Alternatives that share a wire shape cannot be told
+      // apart -- declare a `tag` in glz::meta when that matters.
+      //
+      // The strict pass reads a contested alternative with conversions off and any other as asked; the
+      // lenient pass retries only the contested ones, as the rest have had their lenient read.
+      template <auto Opts, bool Strict>
+      static bool try_each_pass(auto& value, is_context auto& ctx, auto& it, auto end, error_code& input_error) noexcept
+      {
+         bool matched = false;
+         bool exhausted = false;
+         const auto start = it;
+         for_each<variant_size>([&]<size_t I>() {
+            // The strict pass already gave an uncontested alternative its lenient read.
+            constexpr bool already_read = not Strict && not contested[I];
+            if (already_read || matched || exhausted || input_error == error_code::exceeded_max_recursive_depth) {
+               // Nesting past the limit is a property of the input: no other alternative can read it,
+               // and re-parsing the subtree per alternative at every level is exponential.
+               return;
+            }
+            using V = std::variant_alternative_t<I, T>;
+            it = start;
+            ctx.error = error_code::none;
+            ctx.custom_error_message = {}; // else a rejected alternative's message outlives its error
+            // Read into a fresh alternative and move it in, so a miss leaves `value` as it was.
+            V v{};
+            if constexpr (Strict && contested[I]) {
+               from<CBOR, V>::template op<opt_false<Opts, allow_conversions_opt_tag{}>>(v, ctx, it, end);
+            }
+            else {
+               from<CBOR, V>::template op<Opts>(v, ctx, it, end);
+            }
+            // Charge only what a REJECTED attempt parsed. That is the wasted work the bound is about;
+            // charging the match too would bill every enclosing level for the same bytes and make a
+            // valid nest look exponential.
+            const bool budget_left = bool(ctx.error) ? charge_speculation(ctx, size_t(it - start)) : true;
+            if (!bool(ctx.error)) {
+               value.template emplace<I>(std::move(v));
+               matched = true;
+            }
+            else if (ctx.error == error_code::unexpected_end || ctx.error == error_code::exceeded_max_recursive_depth) {
+               input_error = ctx.error;
+            }
+            if (!budget_left) {
+               // Out of speculation budget: keep this alternative's error and stop.
+               exhausted = true;
+            }
+         });
+         if (!matched) {
+            it = start;
+         }
+         return matched;
+      }
+
+      // Resolve an undeclared variant from CBOR's own major type.
       template <auto Opts>
-      GLZ_ALWAYS_INLINE static void op(auto& value, is_context auto& ctx, auto& it, auto end) noexcept
+      static void try_each(auto& value, is_context auto& ctx, auto& it, auto end) noexcept
+      {
+         const auto start = it;
+         error_code input_error{};
+         // Strict first where alternatives compete, so a lenient reader cannot claim a value an exact
+         // alternative wants: the floating point reader accepts an integer under allow_conversions,
+         // which would otherwise let `double` take a value that a later `int64_t` alternative holds
+         // exactly.
+         if (try_each_pass<Opts, true>(value, ctx, it, end, input_error)) {
+            return;
+         }
+         if constexpr (check_allow_conversions(Opts)) {
+            // A lenient retry cannot make over-nested input readable, and running it doubles the work
+            // at every level of a deep nest.
+            if (input_error != error_code::exceeded_max_recursive_depth &&
+                try_each_pass<Opts, false>(value, ctx, it, end, input_error)) {
+               return;
+            }
+         }
+         it = start;
+         // An incomplete or over-nested buffer is a property of the input, not of the alternative set,
+         // so report it as such instead of blaming variant resolution.
+         ctx.error = input_error != error_code::none ? input_error : error_code::no_matching_variant_type;
+      }
+
+      // Decode the discriminator value at `it` and map it to an alternative index, advancing past it.
+      // Returns variant_size when the id names no alternative and there is no unlabeled default.
+      template <auto Opts>
+      static size_t resolve_id(is_context auto& ctx, auto& it, auto end) noexcept
+      {
+         using namespace cbor;
+         using id_type = std::decay_t<decltype(ids_v<T>[0])>;
+         size_t index = ids_v<T>.size();
+
+         if constexpr (std::integral<id_type>) {
+            id_type id{};
+            from<CBOR, id_type>::template op<Opts>(id, ctx, it, end);
+            if (bool(ctx.error)) [[unlikely]] {
+               return variant_size;
+            }
+            index = variant_id_to_index<T>::op(id);
+         }
+         else {
+            if (it >= end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return variant_size;
+            }
+            const uint8_t initial = static_cast<uint8_t>(*it);
+            if (get_major_type(initial) != major::tstr) [[unlikely]] {
+               ctx.error = error_code::syntax_error;
+               return variant_size;
+            }
+            ++it;
+            const uint64_t len = cbor_detail::decode_arg(ctx, it, end, get_additional_info(initial));
+            if (bool(ctx.error)) [[unlikely]] {
+               return variant_size;
+            }
+            if (static_cast<uint64_t>(end - it) < len) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return variant_size;
+            }
+            const sv id{reinterpret_cast<const char*>(it), static_cast<size_t>(len)};
+            it += len;
+            index = variant_id_to_index<T>::op(id.data(), id.data() + id.size(), id.size());
+         }
+
+         return variant_index_from_id<T>(index);
+      }
+
+      // Walk the map once, resolving the discriminator and consuming every entry. `on_content` sees
+      // each non-discriminator key and decides whether to parse or skip its value. Indefinite-length
+      // maps are accepted here as they are by the object reader, since that is what a streaming CBOR
+      // encoder emits.
+      template <auto Opts>
+      static size_t scan_map(is_context auto& ctx, auto& it, auto end, auto&& on_content) noexcept
       {
          using namespace cbor;
 
          if (it >= end) [[unlikely]] {
             ctx.error = error_code::unexpected_end;
-            return;
+            return variant_size;
          }
-
-         uint8_t initial;
-         std::memcpy(&initial, it, 1);
+         const uint8_t initial = static_cast<uint8_t>(*it);
+         if (get_major_type(initial) != major::map) [[unlikely]] {
+            ctx.error = error_code::syntax_error;
+            return variant_size;
+         }
          ++it;
-
-         const uint8_t major_type = get_major_type(initial);
-         const uint8_t additional_info = get_additional_info(initial);
-
-         // Expect array of [index, value]
-         if (major_type != major::array) [[unlikely]] {
-            ctx.error = error_code::syntax_error;
-            return;
+         const uint8_t info_bits = get_additional_info(initial);
+         const bool indefinite = info_bits == info::indefinite;
+         const uint64_t len =
+            indefinite ? (std::numeric_limits<uint64_t>::max)() : cbor_detail::decode_arg(ctx, it, end, info_bits);
+         if (bool(ctx.error)) [[unlikely]] {
+            return variant_size;
          }
 
-         // This reader consumes the [index, value] array itself, so the level is its to count.
-         depth_guard guard{ctx};
-         if (!guard) [[unlikely]] {
+         size_t index = variant_size;
+         for (uint64_t i = 0; i < len && ctx.error == error_code::none; ++i) {
+            if (it >= end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return variant_size;
+            }
+            if (indefinite && static_cast<uint8_t>(*it) == initial_byte(major::simple, simple::break_code)) {
+               ++it;
+               break;
+            }
+            const uint8_t key_initial = static_cast<uint8_t>(*it);
+            if (get_major_type(key_initial) != major::tstr) [[unlikely]] {
+               ctx.error = error_code::syntax_error;
+               return variant_size;
+            }
+            ++it;
+            const uint64_t key_len = cbor_detail::decode_arg(ctx, it, end, get_additional_info(key_initial));
+            if (bool(ctx.error)) [[unlikely]] {
+               return variant_size;
+            }
+            if (static_cast<uint64_t>(end - it) < key_len) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return variant_size;
+            }
+            const sv key{reinterpret_cast<const char*>(it), static_cast<size_t>(key_len)};
+            it += key_len;
+
+            if (key == tag_v<T>) {
+               index = resolve_id<Opts>(ctx, it, end);
+            }
+            else {
+               on_content(key);
+            }
+         }
+         return index;
+      }
+
+      template <auto Opts>
+      static void op(auto& value, is_context auto& ctx, auto& it, auto end) noexcept
+      {
+         if constexpr (tagging == variant_tagging_kind::none) {
+            try_each<Opts>(value, ctx, it, end);
             return;
          }
+         else if constexpr (tagging == variant_tagging_kind::adjacent) {
+            // The adjacent form is a map this reader consumes itself, so it owns that level.
+            depth_guard guard{ctx};
+            if (!guard) [[unlikely]] {
+               return;
+            }
+            read_tagged_map<Opts>(value, ctx, it, end);
+         }
+         else {
+            // The internal form hands the same map to the alternative's object reader, which guards
+            // it -- counting it here too would halve the nesting a tagged variant is allowed.
+            read_tagged_map<Opts>(value, ctx, it, end);
+         }
+      }
 
-         uint64_t count = cbor_detail::decode_arg(ctx, it, end, additional_info);
-         if (bool(ctx.error)) [[unlikely]]
-            return;
+      // Read the keyed map a tagged variant is written as.
+      template <auto Opts>
+      static void read_tagged_map(auto& value, is_context auto& ctx, auto& it, auto end) noexcept
+      {
+         static constexpr auto tag_literal = string_literal_from_view<tag_v<T>.size()>(tag_v<T>);
+         const auto start = it;
 
-         if (count != 2) [[unlikely]] {
-            ctx.error = error_code::syntax_error;
+         // One walk resolves the discriminator wherever it sits in the map and consumes the whole
+         // item, noting where the content value began so the adjacent form can return to it. An
+         // alternative that needs no body is therefore already finished when the walk returns.
+         auto content_it = it;
+         bool content_seen = false;
+         const size_t index = scan_map<Opts>(ctx, it, end, [&](sv key) {
+            if constexpr (tagging == variant_tagging_kind::adjacent) {
+               if (not content_seen && key == content_v<T>) {
+                  content_it = it;
+                  content_seen = true;
+               }
+            }
+            skip_value<CBOR>::op<Opts>(ctx, it, end);
+         });
+         if (bool(ctx.error)) [[unlikely]] {
             return;
          }
-
-         // Read index
-         if (it >= end) [[unlikely]] {
-            ctx.error = error_code::unexpected_end;
-            return;
-         }
-
-         uint8_t idx_initial;
-         std::memcpy(&idx_initial, it, 1);
-         ++it;
-
-         const uint8_t idx_major = get_major_type(idx_initial);
-         const uint8_t idx_info = get_additional_info(idx_initial);
-
-         if (idx_major != major::uint) [[unlikely]] {
-            ctx.error = error_code::syntax_error;
-            return;
-         }
-
-         uint64_t type_index = cbor_detail::decode_arg(ctx, it, end, idx_info);
-         if (bool(ctx.error)) [[unlikely]]
-            return;
-
-         if (type_index >= std::variant_size_v<T>) [[unlikely]] {
+         if (index >= variant_size) [[unlikely]] {
             ctx.error = error_code::no_matching_variant_type;
+            ctx.custom_error_message = variant_ids_string_v<T>;
             return;
          }
 
-         if (value.index() != type_index) {
-            emplace_runtime_variant(value, type_index);
+         if constexpr (tagging == variant_tagging_kind::adjacent) {
+            if (not content_seen) [[unlikely]] {
+               // Resolving the discriminator is not enough: without the content key there is no
+               // value. Checked before emplacing so a rejected buffer leaves `value` as it was.
+               ctx.error = error_code::missing_key;
+               ctx.custom_error_message = content_v<T>;
+               return;
+            }
          }
 
-         std::visit([&](auto& v) { parse<CBOR>::op<Opts>(v, ctx, it, end); }, value);
+         const auto after = it;
+         if (value.index() != index) {
+            emplace_runtime_variant(value, index);
+         }
+
+         if constexpr (tagging == variant_tagging_kind::adjacent) {
+            it = content_it;
+            std::visit([&](auto& v) { parse<CBOR>::op<Opts>(v, ctx, it, end); }, value);
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+            it = after; // the content entry need not be the last one
+         }
+         else {
+            visit<variant_size>(
+               [&]<size_t I>() {
+                  using V = std::variant_alternative_t<I, T>;
+                  using X = variant_alternative_object_t<V>;
+                  constexpr bool struct_like = (glaze_object_t<X> || reflectable<X>) && (not custom_read<X>);
+
+                  if constexpr (variant_unit_alternative<V>) {
+                     // Nothing but the discriminator: pass one already consumed the whole map.
+                  }
+                  else if constexpr (struct_like && (not is_memory_object<V>)) {
+                     // Thread the discriminator key through so it is skipped without disabling
+                     // unknown-key checking for the alternative's real fields. An alternative that
+                     // declares a member of that name keeps receiving its value (JSON parity).
+                     it = start;
+                     from<CBOR, X>::template op<Opts, tag_literal>(std::get<I>(value), ctx, it, end);
+                  }
+                  else if constexpr (requires { Opts.error_on_unknown_keys; }) {
+                     // memory_object / map / pair alternative: tolerate the discriminator key.
+                     static constexpr auto AltOpts = [] {
+                        auto o = Opts;
+                        o.error_on_unknown_keys = false;
+                        return o;
+                     }();
+                     it = start;
+                     from<CBOR, V>::template op<AltOpts>(std::get<I>(value), ctx, it, end);
+                  }
+                  else {
+                     it = after;
+                  }
+               },
+               index);
+         }
       }
    };
 
@@ -1844,82 +2628,33 @@ namespace glz
       }
    };
 
-   // Enums with glaze reflection
-   template <glaze_enum_t T>
-   struct from<CBOR, T>
-   {
-      template <auto Opts>
-      GLZ_ALWAYS_INLINE static void op(auto& value, is_context auto& ctx, auto& it, auto end) noexcept
-      {
-         using namespace cbor;
-
-         if (it >= end) [[unlikely]] {
-            ctx.error = error_code::unexpected_end;
-            return;
-         }
-
-         uint8_t initial;
-         std::memcpy(&initial, it, 1);
-         ++it;
-
-         const uint8_t major_type = get_major_type(initial);
-         const uint8_t additional_info = get_additional_info(initial);
-
-         if (major_type == major::uint) {
-            uint64_t n = cbor_detail::decode_arg(ctx, it, end, additional_info);
-            if (bool(ctx.error)) [[unlikely]]
-               return;
-            value = static_cast<std::decay_t<T>>(n);
-         }
-         else if (major_type == major::nint) {
-            uint64_t n = cbor_detail::decode_arg(ctx, it, end, additional_info);
-            if (bool(ctx.error)) [[unlikely]]
-               return;
-            value = static_cast<std::decay_t<T>>(~n);
-         }
-         else [[unlikely]] {
-            ctx.error = error_code::syntax_error;
-         }
-      }
-   };
-
-   // Plain enums
+   // Enums, reflected or plain: both are read as the ordinal, so one reader covers them
    template <class T>
-      requires(std::is_enum_v<T> && !glaze_enum_t<T>)
+      requires(std::is_enum_v<T>)
    struct from<CBOR, T>
    {
       template <auto Opts>
       GLZ_ALWAYS_INLINE static void op(auto& value, is_context auto& ctx, auto& it, auto end) noexcept
       {
-         using namespace cbor;
-
-         if (it >= end) [[unlikely]] {
-            ctx.error = error_code::unexpected_end;
+         // Read the ordinal through the range-checked integer reader so an out-of-range wire
+         // value is rejected instead of being silently truncated into the underlying type.
+         // bool is a legal fixed underlying type, and the writer emits such an enum as a CBOR
+         // integer, so route it through the uint8_t reader rather than the boolean reader.
+         using underlying = std::underlying_type_t<std::decay_t<T>>;
+         using U = std::conditional_t<std::same_as<underlying, bool>, uint8_t, underlying>;
+         U u{};
+         from<CBOR, U>::template op<Opts>(u, ctx, it, end);
+         if (bool(ctx.error)) [[unlikely]]
             return;
-         }
-
-         uint8_t initial;
-         std::memcpy(&initial, it, 1);
-         ++it;
-
-         const uint8_t major_type = get_major_type(initial);
-         const uint8_t additional_info = get_additional_info(initial);
-
-         if (major_type == major::uint) {
-            uint64_t n = cbor_detail::decode_arg(ctx, it, end, additional_info);
-            if (bool(ctx.error)) [[unlikely]]
+         if constexpr (std::same_as<underlying, bool>) {
+            // The uint8_t bound is wider than bool's domain, so anything above 1 has to be
+            // rejected here: casting it into a bool-backed enum would be undefined behavior.
+            if (u > 1) [[unlikely]] {
+               ctx.error = error_code::parse_number_failure;
                return;
-            value = static_cast<std::decay_t<T>>(n);
+            }
          }
-         else if (major_type == major::nint) {
-            uint64_t n = cbor_detail::decode_arg(ctx, it, end, additional_info);
-            if (bool(ctx.error)) [[unlikely]]
-               return;
-            value = static_cast<std::decay_t<T>>(~n);
-         }
-         else [[unlikely]] {
-            ctx.error = error_code::syntax_error;
-         }
+         value = static_cast<std::decay_t<T>>(u);
       }
    };
 
@@ -2083,14 +2818,14 @@ namespace glz
       }
    }
 
-   // system_clock::time_point - decoder accepts:
-   //   - tag 0 + tstr (RFC 8949 §3.4.1 canonical; what glaze writes)
+   // system_clock / utc_clock time_point - decoder accepts:
+   //   - tag 0 + tstr (RFC 8949 §3.4.1 canonical; what glaze writes; :60 only for utc_clock)
    //   - tag 1 + int/float seconds (RFC 8949 §3.4.2; converted from epoch)
    //   - bare tstr (no tag) - lenient for producers that omit tag 0
    // Bare numbers and any other shape are rejected: the unit would be ambiguous.
    // Note: this does NOT cross-read with epoch_time<Duration>, which writes tag 1
    // directly; decode into the type that matches the wire form you expect.
-   template <is_system_time_point T>
+   template <is_calendar_time_point T>
    struct from<CBOR, T>
    {
       template <auto Opts>
@@ -2136,7 +2871,15 @@ namespace glz
                cbor_detail::decode_tag1_payload<Opts, Duration>(ctx, it, end, tp);
                if (bool(ctx.error)) [[unlikely]]
                   return;
-               value = std::chrono::time_point_cast<Duration>(tp);
+               if constexpr (is_utc_time_point<T>) {
+                  // Epoch seconds are POSIX time, which has no leap seconds.
+                  const auto secs = std::chrono::floor<std::chrono::seconds>(tp);
+                  chrono_detail::from_wall_clock(value, secs.time_since_epoch(), std::chrono::nanoseconds{tp - secs},
+                                                 false, ctx.error);
+               }
+               else {
+                  value = std::chrono::time_point_cast<Duration>(tp);
+               }
             }
             else [[unlikely]] {
                ctx.error = error_code::syntax_error;
@@ -2232,6 +2975,7 @@ namespace glz
          return error_ctx{file_error};
       }
 
-      return read<set_cbor<Opts>()>(value, buffer, ctx);
+      // The buffer was sized to the file, so the caller's is_padded promise does not cover it.
+      return read<is_padded_off<set_cbor<Opts>()>()>(value, buffer, ctx);
    }
 }

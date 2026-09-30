@@ -8,8 +8,11 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 
 #include "glaze/glaze.hpp"
@@ -136,7 +139,7 @@ class CertificateGenerator
       X509_gmtime_adj(X509_get_notAfter(x509), static_cast<long>(days) * 24 * 60 * 60);
       X509_set_pubkey(x509, pkey);
 
-      X509_NAME* name = X509_get_subject_name(x509);
+      X509_NAME* name = X509_NAME_new();
       X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("US"), -1, -1, 0);
       X509_NAME_add_entry_by_txt(name, "ST", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("Test"), -1, -1, 0);
       X509_NAME_add_entry_by_txt(name, "L", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("Test"), -1, -1, 0);
@@ -144,7 +147,9 @@ class CertificateGenerator
       X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(subject.c_str()), -1,
                                  -1, 0);
 
+      X509_set_subject_name(x509, name);
       X509_set_issuer_name(x509, name);
+      X509_NAME_free(name);
 
       if (subject == "localhost") {
          X509V3_CTX ctx;
@@ -190,7 +195,12 @@ class CertificateGenerator
    }
 
   public:
-   static bool generate_certificates(const std::string& prefix = "client_test")
+   // subject defaults to "localhost" so the generated certificate matches the test
+   // server's hostname. Pass a different subject to produce a certificate that is a
+   // genuinely distinct trust anchor: two self-signed certificates sharing a subject DN
+   // collide in OpenSSL's X509_STORE, which is not what callers of this want to exercise.
+   static bool generate_certificates(const std::string& prefix = "client_test",
+                                     const std::string& subject = "localhost")
    {
       cleanup_openssl_errors();
 
@@ -199,7 +209,7 @@ class CertificateGenerator
          return false;
       }
 
-      std::unique_ptr<X509, decltype(&X509_free)> cert(create_certificate(pkey.get(), "localhost", 365), X509_free);
+      std::unique_ptr<X509, decltype(&X509_free)> cert(create_certificate(pkey.get(), subject, 365), X509_free);
       if (!cert) {
          return false;
       }
@@ -370,6 +380,84 @@ class TestHTTPSServer
 // Global test server - initialized before tests run
 static TestHTTPSServer g_server;
 
+// A deliberately permissive TLS server that offers exactly one protocol version, used to
+// probe what the client is willing to negotiate. Its security level is dropped to 0 so the
+// version window is the only thing under test; glz::https_server cannot stand in here
+// because it (correctly) refuses to offer the deprecated protocols at all.
+class SingleVersionTLSServer
+{
+   asio::io_context io_;
+   std::optional<asio::ip::tcp::acceptor> acceptor_;
+   std::thread thread_;
+   uint16_t port_{};
+   bool ok_{false};
+
+  public:
+   explicit SingleVersionTLSServer(int version)
+   {
+      try {
+         auto ctx = std::make_shared<asio::ssl::context>(asio::ssl::context::tls_server);
+         SSL_CTX_set_security_level(ctx->native_handle(), 0);
+         if (SSL_CTX_set_min_proto_version(ctx->native_handle(), version) != 1 ||
+             SSL_CTX_set_max_proto_version(ctx->native_handle(), version) != 1) {
+            return;
+         }
+         ctx->use_certificate_chain_file("client_test_cert.pem");
+         ctx->use_private_key_file("client_test_key.pem", asio::ssl::context::pem);
+
+         acceptor_.emplace(io_, asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+         port_ = acceptor_->local_endpoint().port();
+         ok_ = true;
+
+         thread_ = std::thread([this, ctx]() {
+            // One handshake is enough; the client either negotiates or it does not.
+            asio::error_code ec;
+            asio::ssl::stream<asio::ip::tcp::socket> stream(io_, *ctx);
+            acceptor_->accept(stream.lowest_layer(), ec);
+            if (ec) return;
+            stream.handshake(asio::ssl::stream_base::server, ec);
+            if (ec) return;
+            // Answer anything at all so a successful handshake yields a usable response.
+            const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            asio::write(stream, asio::buffer(reply), ec);
+            stream.shutdown(ec);
+         });
+      }
+      catch (const std::exception&) {
+         ok_ = false;
+      }
+   }
+
+   ~SingleVersionTLSServer()
+   {
+      asio::error_code ec;
+      if (acceptor_) acceptor_->close(ec);
+      io_.stop();
+      if (thread_.joinable()) thread_.join();
+   }
+
+   bool ok() const { return ok_; }
+   uint16_t port() const { return port_; }
+};
+
+// True when glz::http_client completes a request against a server offering only `version`.
+// Certificate verification is off and the client's security level is dropped to 0 so that the
+// protocol version is the only variable. Without lowering the level the deprecated protocols
+// are rejected by OpenSSL's own policy, which would make this probe pass whether or not the
+// context carries the explicit no_tlsv1/no_tlsv1_1 options.
+static bool client_negotiates(int version)
+{
+   SingleVersionTLSServer server(version);
+   if (!server.ok()) {
+      return false;
+   }
+   glz::http_client client;
+   client.set_ssl_verify_mode(asio::ssl::verify_none);
+   client.configure_ssl_context([](asio::ssl::context& ctx) { SSL_CTX_set_security_level(ctx.native_handle(), 0); });
+   auto result = client.get("https://127.0.0.1:" + std::to_string(server.port()) + "/");
+   return result.has_value();
+}
+
 // Test suite
 suite https_client_tests = [] {
    "https_get_request"_test = [] {
@@ -448,15 +536,15 @@ suite https_client_tests = [] {
       glz::http_client client;
       client.set_ssl_verify_mode(asio::ssl::verify_none);
 
-      std::unordered_map<std::string, std::string> headers;
-      headers["X-Custom-Header"] = "CustomValue";
-      headers["Authorization"] = "Bearer test-token";
+      glz::http_headers headers;
+      headers.set("X-Custom-Header", "CustomValue");
+      headers.set("Authorization", "Bearer test-token");
 
       auto result = client.get(g_server.base_url() + "/headers", headers);
       expect(result.has_value()) << "HTTPS with custom headers should succeed";
       if (result.has_value()) {
          expect(result->status_code == 200);
-         expect(result->response_body.find("x-custom-header") != std::string::npos);
+         expect(result->response_body.find("X-Custom-Header") != std::string::npos);
       }
    };
 
@@ -628,6 +716,19 @@ suite https_client_tests = [] {
    // Thread-Safe SSL Configuration Tests
    // =========================================================================
 
+   // Control: the harness itself works, so a refusal below is attributable to the version
+   // rather than to the probe server failing to come up.
+   "client_negotiates_tls12_against_permissive_server"_test = [] {
+      expect(client_negotiates(TLS1_2_VERSION)) << "a TLS 1.2 server must still be reachable\n";
+   };
+
+   // asio's tls_client leaves the floor at TLS 1.0, and the OpenSSL security level that
+   // masks this on a default build disappears as soon as a caller lowers it. The explicit
+   // no_tlsv1/no_tlsv1_1 options are what actually hold the RFC 8996 floor.
+   "client_refuses_tls11"_test = [] {
+      expect(!client_negotiates(TLS1_1_VERSION)) << "TLS 1.1 is deprecated by RFC 8996 and must not negotiate\n";
+   };
+
    "configure_ssl_context_callable"_test = [] {
       glz::http_client client;
 
@@ -765,6 +866,162 @@ suite https_client_tests = [] {
       if (result.has_value()) {
          expect(result->status_code == 200);
       }
+   };
+
+   // =========================================================================
+   // Explicit CA Trust Anchor Tests (issue #2773)
+   // =========================================================================
+
+   // Reads a PEM file into a string so it can be handed to the in-memory API.
+   auto read_pem = [](const char* path) -> std::optional<std::string> {
+      std::ifstream file(path, std::ios::binary);
+      if (!file) {
+         return std::nullopt;
+      }
+      return std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+   };
+
+   // Control for the tests below: the test server is self-signed, so a client carrying
+   // only the platform trust anchors must reject it. Anything that follows which does
+   // succeed therefore succeeded because of the anchor it added, not because
+   // verification was off.
+   "https_fails_without_added_ca"_test = [] {
+      if (!g_server.is_initialized()) return;
+
+      glz::http_client client;
+      auto result = client.get("https://localhost:" + std::to_string(g_server.port()) + "/health");
+      expect(!result.has_value()) << "Self-signed server must not verify against platform trust anchors";
+   };
+
+   "add_ca_certificate_file_allows_verified_https"_test = [] {
+      if (!g_server.is_initialized()) return;
+
+      glz::http_client client;
+      auto added = client.add_ca_certificate_file("client_test_cert.pem");
+      expect(added.has_value()) << "Adding a CA bundle file should succeed";
+
+      auto result = client.get("https://localhost:" + std::to_string(g_server.port()) + "/health");
+      expect(result.has_value()) << "Verified HTTPS request should succeed with the added CA";
+      if (result.has_value()) {
+         expect(result->status_code == 200);
+      }
+   };
+
+   "add_ca_certificates_pem_allows_verified_https"_test = [read_pem] {
+      if (!g_server.is_initialized()) return;
+
+      auto pem = read_pem("client_test_cert.pem");
+      expect(pem.has_value()) << "Test certificate should be readable";
+      if (!pem) return;
+
+      glz::http_client client;
+      auto added = client.add_ca_certificates_pem(*pem);
+      expect(added.has_value()) << "Adding an in-memory PEM bundle should succeed";
+
+      auto result = client.get("https://localhost:" + std::to_string(g_server.port()) + "/health");
+      expect(result.has_value()) << "Verified HTTPS request should succeed with the embedded CA";
+      if (result.has_value()) {
+         expect(result->status_code == 200);
+      }
+   };
+
+   // A PEM bundle holds many concatenated certificates; verify the whole bundle is
+   // consumed and that a later anchor does not displace an earlier one.
+   "add_ca_certificates_pem_accepts_concatenated_bundle"_test = [read_pem] {
+      if (!g_server.is_initialized()) return;
+
+      expect(CertificateGenerator::generate_certificates("unrelated_ca_test", "unrelated-ca.invalid"))
+         << "Second test certificate should generate";
+
+      auto server_pem = read_pem("client_test_cert.pem");
+      auto unrelated_pem = read_pem("unrelated_ca_test_cert.pem");
+      expect(server_pem.has_value() && unrelated_pem.has_value()) << "Both certificates should be readable";
+      if (!server_pem || !unrelated_pem) return;
+
+      glz::http_client client;
+      auto added = client.add_ca_certificates_pem(*unrelated_pem + *server_pem);
+      expect(added.has_value()) << "A multi-certificate PEM bundle should load in full";
+
+      auto result = client.get("https://localhost:" + std::to_string(g_server.port()) + "/health");
+      expect(result.has_value()) << "The server anchor later in the bundle should still be trusted";
+      if (result.has_value()) {
+         expect(result->status_code == 200);
+      }
+   };
+
+   "add_ca_certificate_calls_are_additive"_test = [read_pem] {
+      if (!g_server.is_initialized()) return;
+
+      // Generated unconditionally: reusing whatever a previous test or run left behind
+      // would make this depend on test order and let a stale artifact satisfy it.
+      expect(CertificateGenerator::generate_certificates("unrelated_ca_test", "unrelated-ca.invalid"));
+      auto unrelated_pem = read_pem("unrelated_ca_test_cert.pem");
+      expect(unrelated_pem.has_value());
+      if (!unrelated_pem) return;
+
+      glz::http_client client;
+      expect(client.add_ca_certificate_file("client_test_cert.pem").has_value());
+      // Adding a second, unrelated anchor must not drop the first.
+      expect(client.add_ca_certificates_pem(*unrelated_pem).has_value());
+
+      auto result = client.get("https://localhost:" + std::to_string(g_server.port()) + "/health");
+      expect(result.has_value()) << "First anchor should still verify after a second is added";
+   };
+
+   "add_ca_certificate_file_reports_missing_file"_test = [] {
+      glz::http_client client;
+      auto added = client.add_ca_certificate_file("definitely_missing_bundle.pem");
+      expect(!added.has_value()) << "A missing CA bundle file should be reported, not swallowed";
+   };
+
+   // Pins the documented asymmetry between the file and directory overloads: OpenSSL
+   // validates a bundle file immediately but only registers a directory for lazy lookup
+   // during the handshake, so a bad directory cannot be reported here.
+   "add_ca_certificate_directory_defers_path_validation"_test = [] {
+      glz::http_client client;
+      auto added = client.add_ca_certificate_directory("definitely_missing_ca_dir");
+      expect(added.has_value()) << "A directory path is registered lazily, so it is accepted here";
+   };
+
+   "add_ca_certificates_pem_rejects_non_pem_data"_test = [] {
+      glz::http_client client;
+      auto added = client.add_ca_certificates_pem("this is not a certificate");
+      expect(!added.has_value()) << "Non-PEM input should be reported as an error";
+   };
+
+   // A default-constructed string_view has null data, which OpenSSL turns into a null BIO;
+   // asio then reports success having added nothing. Left unguarded, an embedded bundle
+   // that resolved to nothing would look like it loaded and every later request would fail
+   // verification -- precisely the symptom this API exists to prevent.
+   "add_ca_certificates_pem_rejects_empty_input"_test = [] {
+      glz::http_client client;
+
+      auto from_default_view = client.add_ca_certificates_pem(std::string_view{});
+      expect(!from_default_view.has_value()) << "An empty (null-data) bundle should be an error, not silent success";
+
+      const std::string empty{};
+      auto from_empty_string = client.add_ca_certificates_pem(empty);
+      expect(!from_empty_string.has_value()) << "An empty (non-null) bundle should be an error too";
+
+      // Both spellings of "empty" must agree; the underlying OpenSSL behavior does not.
+      expect(from_default_view.error() == from_empty_string.error())
+         << "Empty input should report the same error regardless of whether data() is null";
+   };
+
+   "add_os_ca_certificates_matches_platform"_test = [] {
+      glz::http_client client;
+      auto added = client.add_os_ca_certificates();
+#ifdef _WIN32
+      expect(added.has_value()) << "The Windows ROOT store should yield trust anchors";
+      if (added.has_value()) {
+         expect(*added > 0);
+      }
+#else
+      expect(added.has_value()) << "Platforms without a native store integration report success";
+      if (added.has_value()) {
+         expect(*added == 0) << "Off Windows, OpenSSL's default verify paths already are the OS store";
+      }
+#endif
    };
 
    "concurrent_requests_with_ssl"_test = [] {

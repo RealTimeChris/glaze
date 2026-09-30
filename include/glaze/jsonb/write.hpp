@@ -219,14 +219,7 @@ namespace glz
       template <auto Opts>
       static void op(auto&& value, is_context auto&& ctx, auto&& b, auto& ix)
       {
-         const sv str = [&]() -> const sv {
-            if constexpr (!char_array_t<T> && std::is_pointer_v<std::decay_t<T>>) {
-               return value ? value : "";
-            }
-            else {
-               return sv{value};
-            }
-         }();
+         const sv str = str_view<T>(value);
 
          const uint8_t tc =
             jsonb_detail::string_needs_json_escape(str.data(), str.size()) ? jsonb::type::textraw : jsonb::type::text;
@@ -304,6 +297,14 @@ namespace glz
 
          using map_t = std::remove_cvref_t<decltype(value)>;
          using val_t = std::remove_cvref_t<detail::iterator_second_type<map_t>>;
+         // A JSONB object key must be one of the text types (7-10). Serializing a non-string
+         // key through the generic value writer would emit an INT (or worse) in the key slot,
+         // producing a blob that neither `read_jsonb` nor `jsonb_to_json` will accept and that
+         // SQLite renders as unquoted nonsense like `{1:2}`. Reject it here, matching the
+         // identical assertion in `from<JSONB, T>`.
+         using key_t = std::remove_cvref_t<detail::iterator_first_type<map_t>>;
+         static_assert(str_t<key_t> || std::same_as<key_t, std::string>,
+                       "JSONB objects only support string keys (types 7-10).");
          constexpr bool may_skip = null_t<val_t> && Opts.skip_null_members;
 
          for (auto&& [k, v] : value) {
@@ -330,6 +331,12 @@ namespace glz
       template <auto Opts>
       static void op(auto&& value, is_context auto&& ctx, auto&& b, auto& ix)
       {
+         // A pair becomes a single-entry object, so its first element lands in a key slot and
+         // is subject to the same text-type requirement as a map key.
+         using key_t = std::remove_cvref_t<typename std::remove_cvref_t<T>::first_type>;
+         static_assert(str_t<key_t> || std::same_as<key_t, std::string>,
+                       "JSONB objects only support string keys (types 7-10).");
+
          size_t header_pos{};
          if (!jsonb_detail::reserve_container_header(ctx, b, ix, header_pos)) [[unlikely]] {
             return;
@@ -354,16 +361,7 @@ namespace glz
       template <class T, auto Opts, size_t I>
       consteval bool should_skip_reflected_field()
       {
-         using V = field_t<T, I>;
-         if constexpr (always_skipped<V>) {
-            return true;
-         }
-         else if constexpr (is_any_function_ptr<V>) {
-            return !check_write_function_pointers(Opts);
-         }
-         else {
-            return false;
-         }
+         return skipped_on_write<Opts, T, I>;
       }
 
       // Write the (key, value) pairs of a reflected struct without an enclosing OBJECT
@@ -704,7 +702,7 @@ namespace glz
       {}
    };
 
-   // Generic JSON value — dispatch each variant alternative to the matching JSONB element.
+   // Generic JSON value — write the active alternative as its native JSONB element.
    // Without this specialization, glz::generic would fall through to the variant handler and
    // serialize as an [index, value] array rather than as the native element type.
    template <num_mode Mode, template <class> class MapType>
@@ -713,36 +711,7 @@ namespace glz
       template <auto Opts>
       static void op(auto&& value, is_context auto&& ctx, auto&& b, auto& ix)
       {
-         using G = std::decay_t<decltype(value)>;
-         using array_t = typename G::array_t;
-         using object_t = typename G::object_t;
-
-         std::visit(
-            [&](auto&& v) {
-               using V = std::decay_t<decltype(v)>;
-               if constexpr (std::same_as<V, std::nullptr_t>) {
-                  to<JSONB, std::nullptr_t>::template op<Opts>(nullptr, ctx, b, ix);
-               }
-               else if constexpr (std::same_as<V, bool>) {
-                  to<JSONB, bool>::template op<Opts>(v, ctx, b, ix);
-               }
-               else if constexpr (std::same_as<V, std::string>) {
-                  to<JSONB, std::string>::template op<Opts>(v, ctx, b, ix);
-               }
-               else if constexpr (std::same_as<V, array_t>) {
-                  // Container dispatch: array of generic_json — handled by writable_array_t.
-                  to<JSONB, array_t>::template op<Opts>(v, ctx, b, ix);
-               }
-               else if constexpr (std::same_as<V, object_t>) {
-                  // Map<string, generic_json> — writable_map_t handles it.
-                  to<JSONB, object_t>::template op<Opts>(v, ctx, b, ix);
-               }
-               else {
-                  // Numeric types: uint64_t, int64_t, double depending on Mode.
-                  to<JSONB, V>::template op<Opts>(v, ctx, b, ix);
-               }
-            },
-            value.data);
+         std::visit([&](auto&& v) { serialize<JSONB>::op<Opts>(v, ctx, b, ix); }, value.data);
       }
    };
 

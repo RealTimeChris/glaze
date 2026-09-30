@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.31)
 project(glaze_benchmarks)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -130,6 +130,16 @@ target_link_libraries(generic_benchmark PRIVATE
   bencher::bencher
 )
 target_compile_options(generic_benchmark PRIVATE
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -march=native>
+  $<$<CXX_COMPILER_ID:MSVC>:/O2>
+)
+
+# Deeply nested BEVE variant read growth; exits nonzero if reads grow super-linearly with depth
+add_executable(beve_variant_depth_benchmark beve_variant_depth_benchmark.cpp)
+target_link_libraries(beve_variant_depth_benchmark PRIVATE
+  glaze
+)
+target_compile_options(beve_variant_depth_benchmark PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -march=native>
   $<$<CXX_COMPILER_ID:MSVC>:/O2>
 )

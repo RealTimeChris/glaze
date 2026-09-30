@@ -144,20 +144,22 @@ namespace glz
          std::string origin;
          auto origin_it = req.headers.find("origin");
          if (origin_it != req.headers.end()) {
-            origin = origin_it->second;
+            origin = origin_it->value;
          }
 
          // Check if this is a preflight request (OPTIONS method with specific headers)
          bool is_preflight = (req.method == http_method::OPTIONS) &&
                              (req.headers.find("access-control-request-method") != req.headers.end());
 
-         if (is_preflight && config.handle_preflight) {
+         const bool origin_allowed = !origin.empty() && is_origin_allowed(config, origin);
+
+         if (is_preflight && config.handle_preflight && !origin_allowed) {
             // Origin not allowed, but it's a preflight request - respond with 403
             res.status(403).body("CORS: Origin not allowed");
          }
 
          // Always add CORS headers if origin is allowed
-         if (!origin.empty() && is_origin_allowed(config, origin)) {
+         if (origin_allowed) {
             // Determine which origin to send back
             std::string allowed_origin = "*";
             const bool contains_wildcard = std::find(config.allowed_origins.begin(), config.allowed_origins.end(),
@@ -189,7 +191,7 @@ namespace glz
                }
                else if (auto requested_headers = req.headers.find("access-control-request-headers");
                         requested_headers != req.headers.end()) {
-                  res.header("Access-Control-Allow-Headers", requested_headers->second);
+                  res.header("Access-Control-Allow-Headers", requested_headers->value);
                }
 
                // Add max age

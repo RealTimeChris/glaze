@@ -24,12 +24,6 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
-#if defined(_MSC_VER) && !defined(OPENSSL_NO_APPLINK)
-extern "C" {
-#include <openssl/applink.c>
-}
-#endif
-
 #ifdef DELETE
 #undef DELETE
 #endif
@@ -80,10 +74,12 @@ namespace
       X509_gmtime_adj(X509_get_notAfter(x509), static_cast<long>(days) * 24 * 60 * 60);
       X509_set_pubkey(x509, pkey);
 
-      X509_NAME* name = X509_get_subject_name(x509);
+      X509_NAME* name = X509_NAME_new();
       X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("localhost"), -1, -1,
                                  0);
+      X509_set_subject_name(x509, name);
       X509_set_issuer_name(x509, name);
+      X509_NAME_free(name);
 
       // Add SAN extension
       X509V3_CTX ctx;
@@ -103,6 +99,18 @@ namespace
       return x509;
    }
 
+   // OpenSSL opens and writes the file itself. Handing it a FILE* from this program instead relies on
+   // applink to bridge the two C runtimes, which Windows ARM64 builds of OpenSSL do not provide.
+   template <class WritePem>
+   bool write_pem_file(const char* filename, WritePem&& write_pem)
+   {
+      BIO* bio = BIO_new_file(filename, "w");
+      if (!bio) return false;
+
+      const int result = write_pem(bio);
+      return BIO_free(bio) == 1 && result == 1;
+   }
+
    bool generate_test_certificates()
    {
       EVP_PKEY* pkey = generate_rsa_key();
@@ -114,33 +122,15 @@ namespace
          return false;
       }
 
-      // Write private key
-      FILE* key_file = nullptr;
-#ifdef _MSC_VER
-      fopen_s(&key_file, "wss_test_key.pem", "w");
-#else
-      key_file = fopen("wss_test_key.pem", "w");
-#endif
-      if (key_file) {
-         PEM_write_PrivateKey(key_file, pkey, nullptr, nullptr, 0, nullptr, nullptr);
-         fclose(key_file);
-      }
-
-      // Write certificate
-      FILE* cert_file = nullptr;
-#ifdef _MSC_VER
-      fopen_s(&cert_file, "wss_test_cert.pem", "w");
-#else
-      cert_file = fopen("wss_test_cert.pem", "w");
-#endif
-      if (cert_file) {
-         PEM_write_X509(cert_file, x509);
-         fclose(cert_file);
-      }
+      const bool written =
+         write_pem_file(
+            "wss_test_key.pem",
+            [&](BIO* bio) { return PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr); }) &&
+         write_pem_file("wss_test_cert.pem", [&](BIO* bio) { return PEM_write_bio_X509(bio, x509); });
 
       X509_free(x509);
       EVP_PKEY_free(pkey);
-      return true;
+      return written;
    }
 
    bool certificates_exist()
@@ -292,6 +282,130 @@ suite wss_server_tests = [] {
          expect(client_message.load()) << "Client should receive echo\n";
          expect(client_received == "Echo: Hello WSS!") << "Client should receive correct echo\n";
       }
+
+      client.close();
+      client.context()->stop();
+      client_thread.join();
+      server.stop();
+      server_thread.join();
+   };
+
+   // Issue #2773: before websocket_client gained trust-anchor configuration, the only TLS
+   // knob was set_ssl_verify_mode, so anyone facing a self-signed or otherwise untrusted
+   // server had to disable verification outright. These two cover the replacement.
+   "wss_client_verifies_with_added_ca"_test = [] {
+      bool certs_ok = ensure_test_certificates();
+      expect(certs_ok) << "Failed to generate test certificates";
+      if (!certs_ok) return;
+
+      https_server server;
+      server.load_certificate("wss_test_cert.pem", "wss_test_key.pem");
+      server.set_ssl_verify_mode(0);
+
+      auto ws_server = std::make_shared<websocket_server>();
+      ws_server->on_message([](auto conn, std::string_view msg, ws_opcode opcode) {
+         if (opcode == ws_opcode::text) {
+            conn->send_text("Echo: " + std::string(msg));
+         }
+      });
+      ws_server->on_error([](auto /*conn*/, std::error_code /*ec*/) {});
+
+      server.websocket("/ws", ws_server);
+      server.bind("127.0.0.1", 0);
+      uint16_t port = server.port();
+
+      std::thread server_thread([&]() { server.start(); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+      websocket_client client;
+
+      std::atomic<bool> client_open{false};
+      std::atomic<bool> client_message{false};
+      std::string client_received;
+
+      client.on_open([&]() { client_open = true; });
+      client.on_message([&](std::string_view msg, ws_opcode) {
+         client_received = std::string(msg);
+         client_message = true;
+      });
+      client.on_close([&](ws_close_code, std::string_view) { client.context()->stop(); });
+      client.on_error([](std::error_code) {});
+
+      // Trust the test CA rather than switching verification off. Verification stays at
+      // the default verify_peer, so the handshake below only succeeds if this anchor is
+      // actually being used.
+      auto added = client.add_ca_certificate_file("wss_test_cert.pem");
+      expect(added.has_value()) << "Adding the test CA should succeed\n";
+
+      // "localhost" matches the certificate's CN and SAN, so hostname verification passes.
+      client.connect("wss://localhost:" + std::to_string(port) + "/ws");
+
+      std::thread client_thread([&client]() { client.context()->run(); });
+
+      for (int i = 0; i < 50 && !client_open; ++i) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+
+      expect(client_open.load()) << "WSS client should connect with verification enabled\n";
+
+      if (client_open) {
+         client.send("Hello verified WSS!");
+         for (int i = 0; i < 50 && !client_message; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+         }
+         expect(client_message.load()) << "Client should receive echo over a verified connection\n";
+         expect(client_received == "Echo: Hello verified WSS!") << "Client should receive correct echo\n";
+      }
+
+      client.close();
+      client.context()->stop();
+      client_thread.join();
+      server.stop();
+      server_thread.join();
+   };
+
+   // The TLS context is created on the first trust-anchor call, so set_ssl_verify_mode()
+   // afterwards must still take effect at connect time rather than being silently dropped.
+   "wss_client_verify_mode_applies_after_context_exists"_test = [] {
+      bool certs_ok = ensure_test_certificates();
+      expect(certs_ok) << "Failed to generate test certificates";
+      if (!certs_ok) return;
+
+      https_server server;
+      server.load_certificate("wss_test_cert.pem", "wss_test_key.pem");
+      server.set_ssl_verify_mode(0);
+
+      auto ws_server = std::make_shared<websocket_server>();
+      ws_server->on_error([](auto /*conn*/, std::error_code /*ec*/) {});
+      server.websocket("/ws", ws_server);
+      server.bind("127.0.0.1", 0);
+      uint16_t port = server.port();
+
+      std::thread server_thread([&]() { server.start(); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+      websocket_client client;
+
+      std::atomic<bool> client_open{false};
+      client.on_open([&]() { client_open = true; });
+      client.on_close([&](ws_close_code, std::string_view) { client.context()->stop(); });
+      client.on_error([](std::error_code) {});
+
+      // Force the TLS context into existence first. The server's self-signed certificate
+      // is not trusted by anything this adds, so the connection can only succeed if the
+      // verify mode set afterwards is honored.
+      expect(client.add_os_ca_certificates().has_value()) << "OS trust anchors should load or be a no-op\n";
+      client.set_ssl_verify_mode(asio::ssl::verify_none);
+
+      client.connect("wss://127.0.0.1:" + std::to_string(port) + "/ws");
+
+      std::thread client_thread([&client]() { client.context()->run(); });
+
+      for (int i = 0; i < 50 && !client_open; ++i) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+
+      expect(client_open.load()) << "Verify mode set after the context exists should still apply\n";
 
       client.close();
       client.context()->stop();

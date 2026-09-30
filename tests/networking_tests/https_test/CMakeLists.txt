@@ -1,5 +1,5 @@
 # HTTPS Test CMakeLists.txt
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.31)
 project(https_test)
 
 # Only build if OpenSSL is available
@@ -28,6 +28,7 @@ if(OPENSSL_HEADERS_AVAILABLE)
         OpenSSL::Crypto
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE GLZ_ENABLE_SSL SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    glz_link_windows_cert_store(${PROJECT_NAME})
 
     # Set C++ standard
     target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)

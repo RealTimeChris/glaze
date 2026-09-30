@@ -33,7 +33,7 @@ namespace glz
             return val;
          }
          case info::uint16_follows: {
-            if ((it + 2) > end) [[unlikely]] {
+            if ((end - it) < 2) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return 0;
             }
@@ -46,7 +46,7 @@ namespace glz
             return val;
          }
          case info::uint32_follows: {
-            if ((it + 4) > end) [[unlikely]] {
+            if ((end - it) < 4) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return 0;
             }
@@ -59,7 +59,7 @@ namespace glz
             return val;
          }
          case info::uint64_follows: {
-            if ((it + 8) > end) [[unlikely]] {
+            if ((end - it) < 8) [[unlikely]] {
                ctx.error = error_code::unexpected_end;
                return 0;
             }
@@ -77,17 +77,34 @@ namespace glz
          }
       }
 
+      // A negative integer (major type 1) with argument n is -1 - n, and n is a full 64 bits on the
+      // wire, so the type reaches down to -2^64 where int64_t stops at -2^63. The ~n cast is exact
+      // while n fits int64_t; past that the true value is below int64_t's min and ~n lands in the
+      // positive range instead. A JSON number has no such bound, so the rest of the range is
+      // written as its decimal: '-' followed by n + 1, which only -2^64 itself cannot spell.
+      template <auto Opts, class Buffer>
+      inline void cbor_to_json_negative_integer(is_context auto& ctx, const uint64_t n, Buffer& out, size_t& ix)
+      {
+         if (n <= uint64_t((std::numeric_limits<int64_t>::max)())) [[likely]] {
+            to<JSON, int64_t>::template op<Opts>(static_cast<int64_t>(~n), ctx, out, ix);
+         }
+         else if (n == (std::numeric_limits<uint64_t>::max)()) [[unlikely]] {
+            if (!emit_literal<"-18446744073709551616">(ctx, out, ix)) return;
+         }
+         else {
+            if (!emit_char(ctx, '-', out, ix)) return;
+            to<JSON, uint64_t>::template op<Opts>(n + 1, ctx, out, ix);
+         }
+      }
+
+      template <auto Opts, class Buffer>
+      inline void cbor_to_json_key(auto&& ctx, auto&& it, auto&& end, Buffer& out, auto&& ix, uint32_t recursive_depth);
+
       template <auto Opts, class Buffer>
       inline void cbor_to_json_value(auto&& ctx, auto&& it, auto&& end, Buffer& out, auto&& ix,
                                      uint32_t recursive_depth)
       {
          using namespace cbor;
-
-         // Check recursion depth limit
-         if (recursive_depth >= max_recursive_depth_limit) [[unlikely]] {
-            ctx.error = error_code::exceeded_max_recursive_depth;
-            return;
-         }
 
          if (it >= end) [[unlikely]] {
             ctx.error = error_code::unexpected_end;
@@ -100,6 +117,15 @@ namespace glz
 
          const uint8_t major_type = get_major_type(initial);
          const uint8_t additional_info = get_additional_info(initial);
+
+         // `recursive_depth` is the number of levels enclosing this value. Arrays, maps, and the tags
+         // that wrap a value open another; scalars do not, so as in the readers a scalar may sit
+         // inside the deepest container the limit allows.
+         const bool opens_level = major_type == major::array || major_type == major::map || major_type == major::tag;
+         if (opens_level && recursive_depth >= max_recursive_depth_limit) [[unlikely]] {
+            ctx.error = error_code::exceeded_max_recursive_depth;
+            return;
+         }
 
          switch (major_type) {
          case major::uint: {
@@ -116,17 +142,17 @@ namespace glz
             const uint64_t n = cbor_to_json_decode_arg(ctx, it, end, additional_info);
             if (bool(ctx.error)) [[unlikely]]
                return;
-            // Use two's complement trick for safe conversion
-            const int64_t value = static_cast<int64_t>(~n);
-            to<JSON, int64_t>::template op<Opts>(value, ctx, out, ix);
+            cbor_to_json_negative_integer<Opts>(ctx, n, out, ix);
             break;
          }
 
          case major::bstr: {
-            // Byte string - encode as base64 in JSON
+            // Byte string - written as a JSON string of hex digit pairs (see emit_hex_bytes)
+            if (!emit_char(ctx, '"', out, ix)) return;
+
             if (additional_info == info::indefinite) {
-               // Indefinite-length byte string - collect chunks first
-               std::vector<uint8_t> bytes;
+               // Indefinite-length byte string - each chunk is hex encoded as it is read, so a long
+               // byte string never has to be assembled in memory first
                while (true) {
                   if (it >= end) [[unlikely]] {
                      ctx.error = error_code::unexpected_end;
@@ -158,22 +184,9 @@ namespace glz
                      return;
                   }
 
-                  if (chunk_len > 0) {
-                     const size_t old_size = bytes.size();
-                     bytes.resize(old_size + chunk_len);
-                     std::memcpy(bytes.data() + old_size, it, chunk_len);
-                     it += chunk_len;
-                  }
+                  if (!emit_hex_bytes(ctx, it, chunk_len, out, ix)) return;
+                  it += chunk_len;
                }
-               // Write as base64-encoded string
-               dump('"', out, ix);
-               // Simple hex encoding for now (TODO: proper base64)
-               for (uint8_t b : bytes) {
-                  static constexpr char hex[] = "0123456789abcdef";
-                  dump(hex[(b >> 4) & 0xf], out, ix);
-                  dump(hex[b & 0xf], out, ix);
-               }
-               dump('"', out, ix);
             }
             else {
                const uint64_t length = cbor_to_json_decode_arg(ctx, it, end, additional_info);
@@ -185,18 +198,11 @@ namespace glz
                   return;
                }
 
-               // Write as hex-encoded string
-               dump('"', out, ix);
-               for (uint64_t i = 0; i < length; ++i) {
-                  static constexpr char hex[] = "0123456789abcdef";
-                  uint8_t b;
-                  std::memcpy(&b, it + i, 1);
-                  dump(hex[(b >> 4) & 0xf], out, ix);
-                  dump(hex[b & 0xf], out, ix);
-               }
-               dump('"', out, ix);
+               if (!emit_hex_bytes(ctx, it, length, out, ix)) return;
                it += length;
             }
+
+            if (!emit_char(ctx, '"', out, ix)) return;
             break;
          }
 
@@ -239,7 +245,7 @@ namespace glz
                   str.append(reinterpret_cast<const char*>(it), chunk_len);
                   it += chunk_len;
                }
-               to<JSON, std::string_view>::template op<Opts>(str, ctx, out, ix);
+               detail::emit_untrusted_string<Opts>(ctx, str, out, ix);
             }
             else {
                const uint64_t length = cbor_to_json_decode_arg(ctx, it, end, additional_info);
@@ -252,14 +258,27 @@ namespace glz
                }
 
                const sv value{reinterpret_cast<const char*>(it), static_cast<size_t>(length)};
-               to<JSON, sv>::template op<Opts>(value, ctx, out, ix);
+               detail::emit_untrusted_string<Opts>(ctx, value, out, ix);
                it += length;
             }
             break;
          }
 
          case major::array: {
-            dump('[', out, ix);
+            // The elements of an array stay on one line, so a separator is ',' or ", "
+            const auto convert_element = [&](const bool needs_comma) {
+               if (needs_comma) {
+                  if constexpr (Opts.prettify) {
+                     if (!emit_literal<", ">(ctx, out, ix)) return;
+                  }
+                  else {
+                     if (!emit_char(ctx, ',', out, ix)) return;
+                  }
+               }
+               cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
+            };
+
+            if (!emit_char(ctx, '[', out, ix)) return;
 
             if (additional_info == info::indefinite) {
                // Indefinite-length array
@@ -277,17 +296,10 @@ namespace glz
                      break;
                   }
 
-                  if (!first) {
-                     dump(',', out, ix);
-                     if constexpr (Opts.prettify) {
-                        dump(' ', out, ix);
-                     }
-                  }
-                  first = false;
-
-                  cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
+                  convert_element(!first);
                   if (bool(ctx.error)) [[unlikely]]
                      return;
+                  first = false;
                }
             }
             else {
@@ -296,112 +308,96 @@ namespace glz
                   return;
 
                for (uint64_t i = 0; i < count; ++i) {
-                  if (i > 0) {
-                     dump(',', out, ix);
-                     if constexpr (Opts.prettify) {
-                        dump(' ', out, ix);
-                     }
-                  }
-                  cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
+                  convert_element(i > 0);
                   if (bool(ctx.error)) [[unlikely]]
                      return;
                }
             }
 
-            dump(']', out, ix);
+            if (!emit_char(ctx, ']', out, ix)) return;
             break;
          }
 
          case major::map: {
-            dump('{', out, ix);
-            if constexpr (Opts.prettify) {
-               ctx.depth += check_indentation_width(Opts);
-            }
+            if (!emit_char(ctx, '{', out, ix)) return;
 
-            if (additional_info == info::indefinite) {
-               // Indefinite-length map
-               bool first = true;
-               while (true) {
-                  if (it >= end) [[unlikely]] {
-                     ctx.error = error_code::unexpected_end;
-                     return;
-                  }
-                  uint8_t peek;
-                  std::memcpy(&peek, it, 1);
+            // A prettified map only breaks the line before its '}' when it holds at least one
+            // pair, so an empty map stays "{}" whether its length was definite or indefinite.
+            bool wrote_pair = false;
 
-                  if (peek == initial_byte(major::simple, simple::break_code)) {
-                     ++it;
-                     break;
-                  }
-
-                  if (!first) {
-                     dump(',', out, ix);
-                  }
-                  if constexpr (Opts.prettify) {
-                     dump('\n', out, ix);
-                     dumpn(check_indentation_char(Opts), ctx.depth, out, ix);
-                  }
-                  first = false;
-
-                  // Key (must be string for JSON compatibility)
-                  cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
-                  if (bool(ctx.error)) [[unlikely]]
-                     return;
-
-                  if constexpr (Opts.prettify) {
-                     dump(": ", out, ix);
-                  }
-                  else {
-                     dump(':', out, ix);
-                  }
-
-                  // Value
-                  cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
-                  if (bool(ctx.error)) [[unlikely]]
-                     return;
+            // One pair: the ',' separating it from the pair before, the line a prettified map opens
+            // for it, then the key, the colon, and the value.
+            const auto convert_pair = [&](const bool needs_comma) {
+               if (needs_comma) {
+                  if (!emit_char(ctx, ',', out, ix)) return;
                }
-            }
-            else {
-               const uint64_t count = cbor_to_json_decode_arg(ctx, it, end, additional_info);
+               if constexpr (Opts.prettify) {
+                  if (!emit_newline_indent<Opts>(ctx, out, ix)) return;
+               }
+
+               // Key (must be a string for JSON compatibility)
+               cbor_to_json_key<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
                if (bool(ctx.error)) [[unlikely]]
                   return;
 
-               for (uint64_t i = 0; i < count; ++i) {
-                  if (i > 0) {
-                     dump(',', out, ix);
-                  }
-                  if constexpr (Opts.prettify) {
-                     dump('\n', out, ix);
-                     dumpn(check_indentation_char(Opts), ctx.depth, out, ix);
-                  }
+               if constexpr (Opts.prettify) {
+                  if (!emit_literal<": ">(ctx, out, ix)) return;
+               }
+               else {
+                  if (!emit_char(ctx, ':', out, ix)) return;
+               }
 
-                  // Key
-                  cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
+               cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
+            };
+
+            {
+               // The indentation this map adds belongs to this map, so it is raised for the pairs
+               // and no longer: leaving it up on an error path would indent whatever the context
+               // is used for next.
+               const indent_guard indent{ctx, Opts.prettify ? check_indentation_width(Opts) : 0};
+
+               if (additional_info == info::indefinite) {
+                  // Indefinite-length map
+                  while (true) {
+                     if (it >= end) [[unlikely]] {
+                        ctx.error = error_code::unexpected_end;
+                        return;
+                     }
+                     uint8_t peek;
+                     std::memcpy(&peek, it, 1);
+
+                     if (peek == initial_byte(major::simple, simple::break_code)) {
+                        ++it;
+                        break;
+                     }
+
+                     convert_pair(wrote_pair);
+                     if (bool(ctx.error)) [[unlikely]]
+                        return;
+                     wrote_pair = true;
+                  }
+               }
+               else {
+                  const uint64_t count = cbor_to_json_decode_arg(ctx, it, end, additional_info);
                   if (bool(ctx.error)) [[unlikely]]
                      return;
 
-                  if constexpr (Opts.prettify) {
-                     dump(": ", out, ix);
-                  }
-                  else {
-                     dump(':', out, ix);
-                  }
+                  wrote_pair = count > 0;
 
-                  // Value
-                  cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
-                  if (bool(ctx.error)) [[unlikely]]
-                     return;
+                  for (uint64_t i = 0; i < count; ++i) {
+                     convert_pair(i > 0);
+                     if (bool(ctx.error)) [[unlikely]]
+                        return;
+                  }
                }
             }
 
             if constexpr (Opts.prettify) {
-               ctx.depth -= check_indentation_width(Opts);
-               if (additional_info != 0 || additional_info == info::indefinite) {
-                  dump('\n', out, ix);
-                  dumpn(check_indentation_char(Opts), ctx.depth, out, ix);
+               if (wrote_pair) {
+                  if (!emit_newline_indent<Opts>(ctx, out, ix)) return;
                }
             }
-            dump('}', out, ix);
+            if (!emit_char(ctx, '}', out, ix)) return;
             break;
          }
 
@@ -439,6 +435,15 @@ namespace glz
                   return;
                }
 
+               // Tags 83 and 87 hold IEEE binary128 elements, which no C++ floating point type this
+               // library writes or reads represents. Rejecting the width here, before the array is
+               // opened, keeps the element loop over widths it can decode and leaves no half
+               // written array behind.
+               if (ta_info.element_size > 8) [[unlikely]] {
+                  ctx.error = error_code::feature_not_supported;
+                  return;
+               }
+
                if (byte_len % ta_info.element_size != 0) [[unlikely]] {
                   ctx.error = error_code::syntax_error;
                   return;
@@ -447,16 +452,26 @@ namespace glz
                const size_t count = byte_len / ta_info.element_size;
                const bool need_swap = typed_array::needs_byteswap(tag_num);
 
-               dump('[', out, ix);
+               if (!emit_char(ctx, '[', out, ix)) return;
 
                for (size_t i = 0; i < count; ++i) {
                   if (i > 0) {
-                     dump(',', out, ix);
+                     if (!emit_char(ctx, ',', out, ix)) return;
                   }
 
                   // Read and optionally byteswap the element
                   if (ta_info.is_float) {
-                     if (ta_info.element_size == 4) {
+                     if (ta_info.element_size == 2) {
+                        // Half precision (tags 80 and 84) has no C++ type; it widens to double,
+                        // the same conversion decode_half performs for a bare float16 value.
+                        uint16_t half;
+                        std::memcpy(&half, it, 2);
+                        if (need_swap) {
+                           half = std::byteswap(half);
+                        }
+                        to<JSON, double>::template op<Opts>(decode_half(half), ctx, out, ix);
+                     }
+                     else if (ta_info.element_size == 4) {
                         float val;
                         std::memcpy(&val, it, 4);
                         if (need_swap) {
@@ -556,10 +571,14 @@ namespace glz
                      }
                   }
 
+                  if (bool(ctx.error)) [[unlikely]] {
+                     return;
+                  }
+
                   it += ta_info.element_size;
                }
 
-               dump(']', out, ix);
+               if (!emit_char(ctx, ']', out, ix)) return;
             }
             else {
                // Other tags - just output the tagged content
@@ -571,17 +590,20 @@ namespace glz
          case major::simple: {
             switch (additional_info) {
             case simple::false_value:
-               dump("false", out, ix);
+               if (!emit_literal<"false">(ctx, out, ix)) return;
                break;
             case simple::true_value:
-               dump("true", out, ix);
+               if (!emit_literal<"true">(ctx, out, ix)) return;
                break;
             case simple::null_value:
+            // JSON has one empty value and CBOR has two. `undefined` becomes `null` because that is
+            // the only thing JSON can say, so the distinction between "no value" and "absent value"
+            // does not survive the conversion.
             case simple::undefined:
-               dump("null", out, ix);
+               if (!emit_literal<"null">(ctx, out, ix)) return;
                break;
             case simple::float16: {
-               if ((it + 2) > end) [[unlikely]] {
+               if ((end - it) < 2) [[unlikely]] {
                   ctx.error = error_code::unexpected_end;
                   return;
                }
@@ -596,7 +618,7 @@ namespace glz
                break;
             }
             case simple::float32: {
-               if ((it + 4) > end) [[unlikely]] {
+               if ((end - it) < 4) [[unlikely]] {
                   ctx.error = error_code::unexpected_end;
                   return;
                }
@@ -612,7 +634,7 @@ namespace glz
                break;
             }
             case simple::float64: {
-               if ((it + 8) > end) [[unlikely]] {
+               if ((end - it) < 8) [[unlikely]] {
                   ctx.error = error_code::unexpected_end;
                   return;
                }
@@ -659,9 +681,89 @@ namespace glz
             break;
          }
       }
+
+      // A JSON object key must be a string. Integer keys (pervasive in
+      // COSE/CWT/WebAuthn) become quoted decimal strings, one of the string
+      // forms RFC 8949 section 6.1 allows a converter to choose. Emitting them
+      // bare produced structurally invalid JSON while reporting success. Text
+      // and byte-string keys already emit as JSON strings via the value path,
+      // a tag on a key is unwrapped and the tagged content re-checked, and key
+      // types with no JSON string form (array, map, float, simple) are rejected.
+      // Mirrors the string/integer key handling in beve_to_json_value's object case.
+      template <auto Opts, class Buffer>
+      inline void cbor_to_json_key(auto&& ctx, auto&& it, auto&& end, Buffer& out, auto&& ix, uint32_t recursive_depth)
+      {
+         using namespace cbor;
+
+         if (it >= end) [[unlikely]] {
+            ctx.error = error_code::unexpected_end;
+            return;
+         }
+
+         uint8_t initial;
+         std::memcpy(&initial, it, 1);
+         const uint8_t major_type = get_major_type(initial);
+         const uint8_t additional_info = get_additional_info(initial);
+
+         switch (major_type) {
+         case major::tstr:
+         case major::bstr:
+            // Both already emit as a JSON string (tstr escaped, bstr hex-quoted).
+            cbor_to_json_value<Opts>(ctx, it, end, out, ix, recursive_depth);
+            return;
+         case major::tag: {
+            // Unwrap the tag and key-check the tagged content, so e.g. a tag-0
+            // datetime text key still emits as a string. Typed-array tags
+            // (RFC 8746) decode to a JSON array and are rejected below. The tag is the only key
+            // that recurses, so it is the one that takes a level, as it does as a value.
+            if (recursive_depth >= max_recursive_depth_limit) [[unlikely]] {
+               ctx.error = error_code::exceeded_max_recursive_depth;
+               return;
+            }
+            ++it;
+            const uint64_t tag_num = cbor_to_json_decode_arg(ctx, it, end, additional_info);
+            if (bool(ctx.error)) [[unlikely]]
+               return;
+            if (typed_array::get_info(tag_num).valid) [[unlikely]] {
+               ctx.error = error_code::syntax_error;
+               return;
+            }
+            cbor_to_json_key<Opts>(ctx, it, end, out, ix, recursive_depth + 1);
+            return;
+         }
+         case major::uint:
+         case major::nint: {
+            ++it;
+            const uint64_t arg = cbor_to_json_decode_arg(ctx, it, end, additional_info);
+            if (bool(ctx.error)) [[unlikely]]
+               return;
+
+            if (!emit_char(ctx, '"', out, ix)) return;
+            if (major_type == major::uint) {
+               to<JSON, uint64_t>::template op<Opts>(arg, ctx, out, ix);
+            }
+            else {
+               cbor_to_json_negative_integer<Opts>(ctx, arg, out, ix);
+            }
+            if (bool(ctx.error)) [[unlikely]]
+               return;
+            if (!emit_char(ctx, '"', out, ix)) return;
+            return;
+         }
+         default:
+            ctx.error = error_code::syntax_error;
+            return;
+         }
+      }
    }
 
    // Convert CBOR buffer directly to JSON without intermediate C++ types
+   //
+   // The buffer holds exactly one CBOR data item, which is what a CBOR-encoded document is. An
+   // empty buffer is not one, and a buffer holding several is a CBOR sequence (RFC 8742), whose
+   // items would run together into text no JSON parser accepts. Both are reported rather than
+   // written, because a converter that answers a malformed document with a malformed one just
+   // moves the problem downstream.
    template <auto Opts = glz::opts{}, class CBORBuffer, class JSONBuffer>
    [[nodiscard]] inline error_ctx cbor_to_json(const CBORBuffer& cbor, JSONBuffer& out)
    {
@@ -672,18 +774,26 @@ namespace glz
 
       context ctx{};
 
-      while (it < end) {
-         detail::cbor_to_json_value<Opts>(ctx, it, end, out, ix, 0);
-         if (bool(ctx.error)) {
-            return {0, ctx.error};
-         }
+      if (it >= end) {
+         return {0, error_code::unexpected_end};
+      }
+
+      detail::cbor_to_json_value<Opts>(ctx, it, end, out, ix, 0);
+      if (bool(ctx.error)) {
+         return {ix, ctx.error};
+      }
+
+      if (it < end) {
+         return {ix, error_code::syntax_error};
       }
 
       if constexpr (resizable<JSONBuffer>) {
          out.resize(ix);
       }
 
-      return {};
+      // count is the number of bytes written. A resizable buffer carries its own size, but a
+      // fixed-size one has no other way to learn how much of it now holds JSON.
+      return {ix};
    }
 
    // Convenience function returning string

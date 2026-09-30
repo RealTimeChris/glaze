@@ -158,6 +158,13 @@ namespace bson_test
       bool operator==(const time_s&) const = default;
    };
 
+   // Same key as time_s, but carrying the raw millisecond count so a test can put any int64
+   // datetime on the wire.
+   struct raw_time_s
+   {
+      glz::bson::datetime t{};
+   };
+
    struct duration_s
    {
       std::chrono::milliseconds ms{}; // int64 element
@@ -383,10 +390,38 @@ struct glz::meta<bson_test::meta_nested_s>
    static constexpr auto value = glz::object("child", &T::child, "v", &T::value);
 };
 
+namespace bson_test
+{
+   struct custom_nullable_getter
+   {
+      std::optional<int32_t> opt{};
+      int32_t plain{7};
+      const std::optional<int32_t>& get_opt() const { return opt; }
+      void set_opt(std::optional<int32_t> in) { opt = in; }
+   };
+
+   struct custom_plain_only
+   {
+      int32_t plain{};
+   };
+}
+
+template <>
+struct glz::meta<bson_test::custom_nullable_getter>
+{
+   using T = bson_test::custom_nullable_getter;
+   static constexpr auto value = glz::object("opt", glz::custom<&T::set_opt, &T::get_opt>, "plain", &T::plain);
+};
+
 using namespace bson_test;
 
 namespace
 {
+   struct bson_escape_opts : glz::opts
+   {
+      bool escape_control_characters = true;
+   };
+
    suite bson_interop_tests = [] {
       "spec-canonical-hello-world"_test = [] {
          // {"hello": "world"} — the canonical example from bsonspec.org.
@@ -644,6 +679,26 @@ namespace
          using namespace std::chrono;
          time_s v{system_clock::time_point{milliseconds{1700000000000LL}}};
          expect_roundtrip_equal(v);
+      };
+
+      "chrono-datetime-out-of-range-rejected"_test = [] {
+         using namespace std::chrono;
+         // The datetime is a full int64 of milliseconds, and system_clock counts in something
+         // finer, so the extremes cannot be held. They used to wrap (INT64_MAX decoded as one
+         // millisecond before the epoch) and now fail.
+         for (const int64_t ms : {(std::numeric_limits<int64_t>::max)(), (std::numeric_limits<int64_t>::min)()}) {
+            std::string buffer;
+            expect(!glz::write_bson(raw_time_s{glz::bson::datetime{ms}}, buffer));
+            time_s out{};
+            expect(glz::read_bson(out, buffer) == glz::error_code::parse_error);
+         }
+
+         // Pre-epoch datetimes keep decoding as before.
+         std::string buffer;
+         expect(!glz::write_bson(raw_time_s{glz::bson::datetime{-1500}}, buffer));
+         time_s out{};
+         expect(!glz::read_bson(out, buffer));
+         expect(out.t == system_clock::time_point{milliseconds{-1500}});
       };
 
       "roundtrip-duration"_test = [] {
@@ -1203,6 +1258,47 @@ namespace
       };
    };
 
+   // A glz::custom getter yields its value only at runtime, so the element type byte, and whether a
+   // null result is skipped, have to be decided from what the getter returns.
+   suite bson_custom_getter_tests = [] {
+      "custom-null-getter-skipped-by-default"_test = [] {
+         custom_nullable_getter in{};
+         std::vector<std::byte> buf{};
+         expect(not glz::write_bson(in, buf));
+
+         custom_plain_only out{};
+         auto rec = glz::read_bson(out, buf); // errors on the unknown key "opt" if it was written
+         expect(not rec);
+         expect(out.plain == 7);
+      };
+
+      "custom-null-getter-written-as-null-when-kept"_test = [] {
+         constexpr auto preserve = glz::opts{.skip_null_members = false};
+         custom_nullable_getter in{};
+         std::vector<std::byte> buf{};
+         expect(not glz::write_bson<preserve>(in, buf));
+
+         custom_nullable_getter out{};
+         out.opt = 99;
+         auto rec = glz::read_bson<preserve>(out, buf);
+         expect(not rec);
+         expect(not out.opt.has_value());
+         expect(out.plain == 7);
+      };
+
+      "custom-engaged-getter-round-trips"_test = [] {
+         custom_nullable_getter in{};
+         in.opt = 5;
+         std::vector<std::byte> buf{};
+         expect(not glz::write_bson(in, buf));
+
+         custom_nullable_getter out{};
+         auto rec = glz::read_bson(out, buf);
+         expect(not rec);
+         expect(out.opt == 5);
+      };
+   };
+
    // ===========================================================================
    // Deprecated element types: present on the wire, the reader must skip them
    // cleanly when the receiving type has no such key.
@@ -1445,6 +1541,50 @@ namespace
          auto json = glz::bson_to_json(bson.value());
          expect(json.has_value());
          expect(json.value() == R"({"a":1,"b":9000000000,"c":1.5,"d":true,"e":"hi"})");
+      };
+
+      "convert-rejects-control-characters-by-default"_test = [] {
+         // A control byte is legal in a BSON string but cannot be written as JSON without
+         // \uXXXX, so the default refuses it rather than emitting output that will not re-parse.
+         std::map<std::string, std::string> v{{"k", std::string("a\001b")}};
+         auto bson = glz::write_bson(v);
+         expect(bson.has_value());
+         auto json = glz::bson_to_json(bson.value());
+         expect(not json.has_value());
+         expect(json.error().ec == glz::error_code::invalid_control_character);
+      };
+
+      "convert-escapes-control-characters-when-asked"_test = [] {
+         std::map<std::string, std::string> v{{"k", std::string("a\001b")}};
+         auto bson = glz::write_bson(v);
+         expect(bson.has_value());
+         auto json = glz::bson_to_json<bson_escape_opts{}>(bson.value());
+         expect(json.has_value());
+         expect(json.value() == "{\"k\":\"a\\u0001b\"}") << json.value();
+         std::map<std::string, std::string> round_trip{};
+         expect(!glz::read_json(round_trip, json.value())) << json.value();
+         expect(round_trip == v);
+      };
+
+      "convert-passes-through-short-escape-control-characters"_test = [] {
+         // The default refuses only control characters with no two-character JSON escape.
+         // Backspace, tab, newline, form feed and carriage return have one, so they keep
+         // converting normally. The reject sits in the else of the escape table lookup and
+         // cannot see them. The long value puts the run past the scalar tail and into the
+         // writer's block scan, which rejects at a separate site.
+         const std::string shorts = "\b\t\n\f\r";
+         std::map<std::string, std::string> v{{"k" + shorts, shorts},
+                                              {"long", std::string(64, 'a') + shorts + std::string(64, 'b')}};
+         auto bson = glz::write_bson(v);
+         expect(bson.has_value());
+         auto json = glz::bson_to_json(bson.value());
+         expect(json.has_value());
+         expect(json.value().find("\\b\\t\\n\\f\\r") != std::string::npos) << json.value();
+         expect(json.value().find_first_of(shorts) == std::string::npos) << json.value();
+
+         std::map<std::string, std::string> round_trip{};
+         expect(!glz::read_json(round_trip, json.value())) << json.value();
+         expect(round_trip == v);
       };
 
       "convert-nested-document"_test = [] {
@@ -1862,6 +2002,64 @@ suite bson_char_array_tests = [] {
       expect(not glz::write_bson(src, buffer));
       bson_short_code dst{};
       expect(bool(glz::read_bson(dst, buffer)));
+   };
+};
+
+suite bson_cstring_embedded_null_tests = [] {
+   // A BSON e_name (map key) and the regex pattern/options fields are cstrings: a 0x00 ends the field
+   // on the wire, so a reader truncates the value there and reparses the trailing bytes as further
+   // elements. Without the write-side guard a single crafted map key read back as a document with an
+   // extra forged field while the write returned success.
+   "map key with an embedded null that injects a second field is rejected"_test = [] {
+      // Key "a" 0x00 <int32 1> 0x10 'z' : on the wire it reads back as {"a": 1, "z": 1}.
+      std::map<std::string, int32_t> m;
+      m[std::string("a\x00\x01\x00\x00\x00\x10z", 8)] = 1;
+      std::string buffer{};
+      auto ec = glz::write_bson(m, buffer);
+      expect(bool(ec));
+      expect(ec.ec == glz::error_code::invalid_control_character);
+   };
+
+   "map key with a trailing null is rejected"_test = [] {
+      std::map<std::string, int32_t> m;
+      m[std::string("k\x00", 2)] = 1;
+      std::string buffer{};
+      auto ec = glz::write_bson(m, buffer);
+      expect(bool(ec));
+      expect(ec.ec == glz::error_code::invalid_control_character);
+   };
+
+   "regex pattern with an embedded null is rejected"_test = [] {
+      regex_only_s v{};
+      v.r.pattern = std::string(
+         "ab\x00"
+         "cd",
+         5);
+      v.r.options = "i";
+      std::string buffer{};
+      auto ec = glz::write_bson(v, buffer);
+      expect(bool(ec));
+      expect(ec.ec == glz::error_code::invalid_control_character);
+   };
+
+   "regex options with an embedded null is rejected"_test = [] {
+      regex_only_s v{};
+      v.r.pattern = "ab";
+      v.r.options = std::string("i\x00", 2);
+      std::string buffer{};
+      auto ec = glz::write_bson(v, buffer);
+      expect(bool(ec));
+      expect(ec.ec == glz::error_code::invalid_control_character);
+   };
+
+   "null-free map keys still round trip unchanged"_test = [] {
+      std::map<std::string, int32_t> m{{"alpha", 1}, {"beta.b", 2}, {"has space", 3}};
+      auto w = glz::write_bson(m);
+      expect(w.has_value());
+      std::map<std::string, int32_t> r{};
+      auto ec = glz::read_bson(r, std::string_view{w.value()});
+      expect(not ec);
+      expect(r == m);
    };
 };
 

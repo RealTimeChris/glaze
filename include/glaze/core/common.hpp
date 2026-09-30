@@ -163,6 +163,59 @@ namespace glz
    template <class T>
    concept is_includer = requires(T t) { requires T::glaze_includer == true; };
 
+   // Identity of the type an object's key bits belong to (see context::include_key_type). The
+   // address of each instantiation is unique, so comparing addresses compares types. Deliberately
+   // not const: linkers that fold identical read-only data (MSVC /OPT:ICF, gold --icf=all) could
+   // otherwise give every instantiation the same address, and a false match would reinterpret one
+   // type's key bits as another's.
+   template <class T>
+   inline char include_key_tag{};
+
+   // Publishes an object's missing-key bits on the context while it is parsed, so that an includer
+   // member can hand them to the read of its file, and restores the previous value on the way out.
+   template <class Ctx>
+   struct key_bits_scope final
+   {
+      Ctx& ctx;
+      void* previous;
+
+      key_bits_scope(Ctx& ctx, void* bits) noexcept : ctx(ctx), previous(ctx.key_bits) { ctx.key_bits = bits; }
+      key_bits_scope(const key_bits_scope&) = delete;
+      key_bits_scope& operator=(const key_bits_scope&) = delete;
+      ~key_bits_scope() noexcept { ctx.key_bits = previous; }
+   };
+
+   // Stands in for key_bits_scope in objects that cannot include a file, so they do not touch the
+   // context at all.
+   struct inert_key_bits_scope final
+   {
+      constexpr inert_key_bits_scope(auto&&, void*) noexcept {}
+   };
+
+   // Hands the including object's key bits to the read of an included file, and clears them
+   // afterwards in case that read never claimed them (an included document whose top level is not
+   // the including object, or one that failed before reaching its closing brace).
+   template <class Ctx>
+   struct include_key_scope final
+   {
+      Ctx& ctx;
+
+      include_key_scope(Ctx& ctx, const void* type_tag) noexcept : ctx(ctx)
+      {
+         if (ctx.key_bits) {
+            ctx.include_key_bits = ctx.key_bits;
+            ctx.include_key_type = type_tag;
+         }
+      }
+      include_key_scope(const include_key_scope&) = delete;
+      include_key_scope& operator=(const include_key_scope&) = delete;
+      ~include_key_scope() noexcept
+      {
+         ctx.include_key_bits = nullptr;
+         ctx.include_key_type = nullptr;
+      }
+   };
+
    template <class T>
    concept is_member_function_pointer = std::is_member_function_pointer_v<T>;
 
@@ -275,6 +328,30 @@ namespace glz
 
    template <class T>
    concept char_array_t = str_t<T> && std::is_array_v<std::remove_pointer_t<std::remove_reference_t<T>>>;
+
+   // Views a `str_t` value as a string_view for writing. Every format writes strings through this
+   // so the rules stay in one place.
+   //
+   // A type reaches `str_t` as long as a string_view is constructible from it, which an implicit
+   // `operator const char*` satisfies. Converting through that operator stops at the first embedded
+   // null and discards the type's own size(), so prefer the type's bounds whenever it reports them.
+   // Standard string types agree either way. Null pointers become empty rather than dereferencing.
+   template <class T>
+   [[nodiscard]] GLZ_ALWAYS_INLINE constexpr std::string_view str_view(auto&& value) noexcept
+   {
+      if constexpr (std::same_as<std::decay_t<T>, std::string_view>) {
+         return value; // already the answer; rebuilding it from data() and size() costs instructions
+      }
+      else if constexpr (!char_array_t<T> && std::is_pointer_v<std::decay_t<T>>) {
+         return value ? std::string_view{value} : std::string_view{};
+      }
+      else if constexpr (has_data<T> && has_size<T>) {
+         return std::string_view{value.data(), value.size()};
+      }
+      else {
+         return std::string_view{value};
+      }
+   }
 
    // Concept: does T's mimic type satisfy str_t?
    // This allows checking if a custom type mimics string behavior.
@@ -542,19 +619,27 @@ namespace glz
 
    // P2996 can reflect any class, but we must exclude types with their own Glaze specializations.
    // Types with custom serialization should specialize glz::specified<T> to std::true_type.
+   //
+   // A glaze_wrapper (glz::quoted, glz::invoke, glz::escape_bytes, ...) is a view onto a member, not
+   // a struct: its fields are a reference and perhaps a pointer. A format that has no specialization
+   // for a wrapper must fail to compile rather than reflect it, which would write the wrapper's
+   // internals (often an empty object) and read into them.
    template <class T>
-   concept reflectable = std::is_class_v<std::remove_cvref_t<T>> &&
-                         !(is_no_reflect<T> || glaze_t<T> || meta_keys<T> || range<T> || pair_t<T> || null_t<T> ||
-                           str_t<T> || bool_t<T> || tuple_t<T> || func_t<T> || is_specified<T>);
+   concept reflectable =
+      std::is_class_v<std::remove_cvref_t<T>> &&
+      !(is_no_reflect<T> || glaze_wrapper<std::remove_cvref_t<T>> || glaze_t<T> || meta_keys<T> || range<T> ||
+        pair_t<T> || null_t<T> || str_t<T> || bool_t<T> || tuple_t<T> || func_t<T> || is_specified<T>);
 #else
    // Traditional reflection requires aggregates. The exclusion list mirrors P2996 for consistency.
    // These exclusions handle aggregate types that shouldn't be reflected as objects:
    // str_t: aggregate string-like types, tuple_t: std::array and custom tuple-like aggregates,
-   // func_t: aggregate callables, is_specified: types with explicit serialization.
+   // func_t: aggregate callables, is_specified: types with explicit serialization, glaze_wrapper: views
+   // onto a member (see the P2996 branch above).
    template <class T>
-   concept reflectable = std::is_aggregate_v<std::remove_cvref_t<T>> && std::is_class_v<std::remove_cvref_t<T>> &&
-                         !(is_no_reflect<T> || glaze_t<T> || meta_keys<T> || range<T> || pair_t<T> || null_t<T> ||
-                           str_t<T> || bool_t<T> || tuple_t<T> || func_t<T> || is_specified<T>);
+   concept reflectable =
+      std::is_aggregate_v<std::remove_cvref_t<T>> && std::is_class_v<std::remove_cvref_t<T>> &&
+      !(is_no_reflect<T> || glaze_wrapper<std::remove_cvref_t<T>> || glaze_t<T> || meta_keys<T> || range<T> ||
+        pair_t<T> || null_t<T> || str_t<T> || bool_t<T> || tuple_t<T> || func_t<T> || is_specified<T>);
 #endif
 
    template <class T>

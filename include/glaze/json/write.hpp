@@ -34,6 +34,83 @@
 
 namespace glz
 {
+   namespace detail
+   {
+      // Options for emitting an untrusted byte payload as a JSON string literal through
+      // to<JSON, string_view>. A binary-to-JSON converter turns someone else's blob into JSON
+      // text, so two writer options that would let payload bytes reach the document unescaped
+      // are pinned off: raw_string emits the payload without escaping it at all, and unquoted
+      // drops the surrounding quotes as well. Neither default is reasonable for a foreign blob.
+      //
+      // Control characters are the caller's decision, so escape_control_characters is inherited
+      // rather than pinned. The opts_internal::reject_control_characters flag is set alongside it
+      // to give the default a defined meaning. It is internal because no user sets it: the knob
+      // they reach for is escape_control_characters, and this only says which way its absence
+      // should be read at a converter emit site.
+      //   * off (default) -- a decoded value carrying a control character with no two-character
+      //     escape fails with error_code::invalid_control_character. Nothing is written that
+      //     would not re-parse, and nothing is quietly reshaped.
+      //   * on -- the byte is escaped as \uXXXX and the output round-trips. This is the opt-in
+      //     for payloads that legitimately carry control characters, and it does mean a NUL in
+      //     a decoded value becomes a NUL in whatever reads the JSON back.
+      //
+      // Every binary-to-JSON converter (beve, cbor, bson, eetf, jsonb) routes its string emits
+      // through emit_untrusted_string below, so a new converter should too.
+      template <auto Opts>
+      inline constexpr auto untrusted_string_emit_opts =
+         glz::reject_control_characters<opt_false<opt_false<Opts, raw_string_opt_tag{}>, unquoted_opt_tag{}>>();
+
+      // Bytes the JSON string writer emits for `str` under escape_control_characters, excluding
+      // the surrounding quotes. Only a buffer that cannot grow has any use for this; see the
+      // reservation in to<JSON, str_t>::op. A byte-at-a-time count costs about as much as the
+      // escaping write it is sizing, so this reuses the writer's own 8-byte scan: a block with
+      // nothing to escape adds nothing to the size and is skipped whole.
+      inline size_t escaped_string_size(const std::string_view str) noexcept
+      {
+         const size_t n = str.size();
+         size_t size = n;
+         const char* c = str.data();
+         const char* const e = c + n;
+
+         if (n > 7) {
+            for (const char* const end_m7 = e - 7; c < end_m7;) {
+               uint64_t swar;
+               std::memcpy(&swar, c, 8);
+               if constexpr (std::endian::native == std::endian::big) {
+                  swar = std::byteswap(swar);
+               }
+
+               constexpr uint64_t lo7_mask = repeat_byte8(0b01111111);
+               const uint64_t lo7 = swar & lo7_mask;
+               const uint64_t quote = (lo7 ^ repeat_byte8('"')) + lo7_mask;
+               const uint64_t backslash = (lo7 ^ repeat_byte8('\\')) + lo7_mask;
+               const uint64_t less_32 = (swar & repeat_byte8(0b01100000)) + lo7_mask;
+               uint64_t next = ~((quote & backslash & less_32) | swar);
+
+               next &= repeat_byte8(0b10000000);
+               if (next == 0) {
+                  c += 8;
+                  continue;
+               }
+
+               c += (countr_zero(next) >> 3);
+               size += char_escape_table[uint8_t(*c)] ? 1 : 5; // two-character escape, or \u00XX
+               ++c;
+            }
+         }
+
+         for (; c < e; ++c) {
+            if (char_escape_table[uint8_t(*c)]) {
+               size += 1;
+            }
+            else if (uint8_t(*c) < 0x20) {
+               size += 5;
+            }
+         }
+         return size;
+      }
+   }
+
    // This serialize<JSON> indirection only exists to call std::remove_cvref_t on the type
    // so that type matching doesn't depend on qualifiers.
    // It is recommended to directly call to<JSON, std::remove_cvref_t<T>> to reduce compilation overhead.
@@ -85,7 +162,7 @@ namespace glz
          }
          std::memcpy(&b[ix], ",\n", 2);
          ix += 2;
-         std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+         fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
          ix += ctx.depth;
       }
       else {
@@ -768,10 +845,7 @@ namespace glz
       {
          if constexpr (check_string_as_number(Opts)) {
             const sv str = [&]() -> const sv {
-               if constexpr (!char_array_t<T> && std::is_pointer_v<std::decay_t<T>>) {
-                  return value ? value : "";
-               }
-               else if constexpr (array_char_t<T>) {
+               if constexpr (array_char_t<T>) {
                   const auto* start = value.data();
                   const auto* end = static_cast<const char*>(std::memchr(start, '\0', value.size()));
                   return sv{start, end ? size_t(end - start) : value.size()};
@@ -780,7 +854,7 @@ namespace glz
                   return sv{reinterpret_cast<const char*>(value.data()), value.size()};
                }
                else {
-                  return sv{value};
+                  return str_view<T>(value);
                }
             }();
             if (!ensure_space(ctx, b, ix + str.size() + write_padding_bytes)) [[unlikely]] {
@@ -823,6 +897,11 @@ namespace glz
                   }
                }
                else {
+                  if constexpr (check_reject_control_characters(Opts)) {
+                     if (uint8_t(value) < 0x20) [[unlikely]] {
+                        ctx.error = error_code::invalid_control_character;
+                     }
+                  }
                   std::memcpy(&b[ix], &value, 1);
                   ++ix;
                }
@@ -833,14 +912,11 @@ namespace glz
          else {
             if constexpr (check_raw_string(Opts)) {
                const sv str = [&]() -> const sv {
-                  if constexpr (!char_array_t<T> && std::is_pointer_v<std::decay_t<T>>) {
-                     return value ? value : "";
-                  }
-                  else if constexpr (u8str_t<T>) {
+                  if constexpr (u8str_t<T>) {
                      return sv{reinterpret_cast<const char*>(value.data()), value.size()};
                   }
                   else {
-                     return sv{value};
+                     return str_view<T>(value);
                   }
                }();
 
@@ -867,17 +943,14 @@ namespace glz
             }
             else {
                const sv str = [&]() -> const sv {
-                  if constexpr (!char_array_t<T> && std::is_pointer_v<std::decay_t<T>>) {
-                     return value ? value : "";
-                  }
-                  else if constexpr (array_char_t<T>) {
+                  if constexpr (array_char_t<T>) {
                      return sv{value.data(), value.size()};
                   }
                   else if constexpr (u8str_t<T>) {
                      return sv{reinterpret_cast<const char*>(value.data()), value.size()};
                   }
                   else {
-                     return sv{value};
+                     return str_view<T>(value);
                   }
                }();
                const auto n = str.size();
@@ -886,8 +959,28 @@ namespace glz
                // For each individual character we need room for two characters to handle escapes.
                // When using Unicode escapes, we might need up to 6 characters (\uXXXX) per character
                if constexpr (check_escape_control_characters(Opts)) {
+                  if constexpr (has_bounded_capacity<B>) {
+                     // 6 bytes per character is a ceiling only a string of nothing but control
+                     // characters reaches. A resizable buffer merely over-allocates against it,
+                     // but a fixed buffer has nowhere to grow, so the ceiling would reject output
+                     // that fits. Measuring the string answers exactly, at the cost of a pass over
+                     // it, so bracket the measurement between two O(1) bounds and only pay it when
+                     // the answer is still in doubt: the ceiling fitting means yes, and the floor
+                     // of one byte per character not fitting means no.
+                     const size_t capacity = buffer_traits<std::remove_cvref_t<B>>::capacity(b);
+                     size_t required = ix + 10 + 6 * n;
+                     if (required > capacity) [[unlikely]] {
+                        required = ix + 10 + n;
+                        if (required <= capacity) {
+                           required = ix + 10 + detail::escaped_string_size(str);
+                        }
+                     }
+                     if (!ensure_space(ctx, b, required)) [[unlikely]] {
+                        return;
+                     }
+                  }
                   // We need 2 + 6 * n characters in the worst case (all control chars)
-                  if (!ensure_space(ctx, b, ix + 10 + 6 * n)) [[unlikely]] {
+                  else if (!ensure_space(ctx, b, ix + 10 + 6 * n)) [[unlikely]] {
                      return;
                   }
                }
@@ -936,12 +1029,25 @@ namespace glz
                         }
                      }
                      else {
+                        if constexpr (check_reject_control_characters(Opts)) {
+                           // A control character with no two-character escape cannot be written
+                           // without \uXXXX. The table entry is zero, so the memcpy below would
+                           // put two NULs where one byte was. Flag it and let the loop finish:
+                           // returning early here would leave c un-advanced and the SIMD scan
+                           // would find the same byte forever. The output is abandoned anyway.
+                           if (char_escape_table[uint8_t(*c)] == 0) [[unlikely]] {
+                              ctx.error = error_code::invalid_control_character;
+                           }
+                        }
                         std::memcpy(data, &char_escape_table[uint8_t(*c)], 2);
                         data += 2;
                      }
                      ++c;
                   };
 
+                  // Adding a helper here means adding a branch to string_escape_simd() in
+                  // simd/backends.hpp, which names the widest one this cascade invokes, and a row
+                  // to known_builds in tests/json_test/utf8_validation_test.cpp, which checks it.
 #if defined(GLZ_USE_AVX2)
                   detail::avx2_string_escape(c, e, data, n, write_escape);
 #endif
@@ -1003,6 +1109,11 @@ namespace glz
                         }
                      }
                      else {
+                        if constexpr (check_reject_control_characters(Opts)) {
+                           if (uint8_t(*c) < 0x20) [[unlikely]] {
+                              ctx.error = error_code::invalid_control_character;
+                           }
+                        }
                         std::memcpy(data, c, 1);
                         ++data;
                      }
@@ -1018,31 +1129,116 @@ namespace glz
       }
    };
 
+   namespace detail
+   {
+      // Emit an untrusted byte payload as a JSON string literal. See untrusted_string_emit_opts
+      // for what is pinned and why. UTF-8 is deliberately not checked here: that is the reader's
+      // job, it is on by default there, and unlike the escaping decision it costs a real pass
+      // over every string.
+      template <auto Opts, class B>
+      GLZ_ALWAYS_INLINE void emit_untrusted_string(is_context auto& ctx, const std::string_view s, B& out, size_t& ix)
+      {
+         to<JSON, std::string_view>::template op<untrusted_string_emit_opts<Opts>>(s, ctx, out, ix);
+      }
+
+      // Structural writes for the binary-to-JSON converters.
+      //
+      // dump() grows a resizable buffer but does not bounds check one it cannot grow, so a
+      // converter has to reserve before it writes or it walks off the end of a std::array or
+      // std::span. Each of these folds the reservation into the write, which keeps the byte count
+      // next to the bytes rather than hand-maintained at the call site. They return false, with
+      // ctx.error set to buffer_overflow, when a fixed-size buffer has no room left.
+
+      template <class B>
+      [[nodiscard]] GLZ_ALWAYS_INLINE bool emit_char(is_context auto& ctx, const char c, B& out, size_t& ix)
+      {
+         if (!ensure_space(ctx, out, ix + 1)) [[unlikely]] {
+            return false;
+         }
+         dump<false>(c, out, ix);
+         return true;
+      }
+
+      template <string_literal str, class B>
+      [[nodiscard]] GLZ_ALWAYS_INLINE bool emit_literal(is_context auto& ctx, B& out, size_t& ix)
+      {
+         static constexpr auto s = str.sv();
+         if (!ensure_space(ctx, out, ix + s.size())) [[unlikely]] {
+            return false;
+         }
+         dump<false>(s, out, ix);
+         return true;
+      }
+
+      // The newline and indentation that open a line of prettified output
+      template <auto Opts, class B>
+      [[nodiscard]] GLZ_ALWAYS_INLINE bool emit_newline_indent(is_context auto& ctx, B& out, size_t& ix)
+      {
+         if (!ensure_space(ctx, out, ix + 1 + ctx.depth)) [[unlikely]] {
+            return false;
+         }
+         dump<false>('\n', out, ix);
+         dumpn_unchecked(check_indentation_char(Opts), ctx.depth, out, ix);
+         return true;
+      }
+
+      // Byte payloads have no JSON counterpart, so they are written as a string of two lowercase
+      // hex digits per byte. The caller writes the surrounding quotes, which lets an indefinite
+      // length payload be emitted chunk by chunk rather than assembled first.
+      template <class B>
+      [[nodiscard]] inline bool emit_hex_bytes(is_context auto& ctx, auto data, const uint64_t n, B& out, size_t& ix)
+      {
+         static constexpr char digits[] = "0123456789abcdef";
+
+         if (!ensure_space(ctx, out, ix + 2 * n)) [[unlikely]] {
+            return false;
+         }
+
+         for (uint64_t i = 0; i < n; ++i) {
+            uint8_t b;
+            std::memcpy(&b, data + i, 1);
+            dump<false>(digits[(b >> 4) & 0xf], out, ix);
+            dump<false>(digits[b & 0xf], out, ix);
+         }
+         return true;
+      }
+   }
+
+   namespace detail
+   {
+      // An empty name means the value is not enumerated. Readers reject such values, so writing one is an error.
+      template <auto Opts, class B>
+      GLZ_ALWAYS_INLINE void write_enum_name(const sv name, is_context auto& ctx, B& b, auto& ix)
+      {
+         if (name.empty()) [[unlikely]] {
+            ctx.error = error_code::unexpected_enum;
+            return;
+         }
+         // TODO: Assumes people dont use strings with chars that need to be escaped for their enum names
+         // TODO: Could create a pre quoted map for better performance
+         if (!ensure_space(ctx, b, ix + name.size() + 2 + write_padding_bytes)) [[unlikely]] {
+            return;
+         }
+         if constexpr (not check_unquoted(Opts)) {
+            dump<false>('"', b, ix);
+         }
+         dump<false>(name, b, ix);
+         if constexpr (not check_unquoted(Opts)) {
+            dump<false>('"', b, ix);
+         }
+      }
+   }
+
    template <class T>
       requires((glaze_enum_t<T> || (meta_keys<T> && std::is_enum_v<std::decay_t<T>>)) && not custom_write<T>)
    struct to<JSON, T>
    {
-      static constexpr bool can_error = false;
+      static constexpr bool can_error = true;
 
-      template <auto Opts, class... Args>
-      GLZ_ALWAYS_INLINE static void op(auto&& value, is_context auto&& ctx, Args&&... args)
+      template <auto Opts, class B>
+      GLZ_ALWAYS_INLINE static void op(auto&& value, is_context auto&& ctx, B&& b, auto& ix)
       {
-         const sv str = get_enum_name(value);
-         if (!str.empty()) {
-            // TODO: Assumes people dont use strings with chars that need to be escaped for their enum names
-            // TODO: Could create a pre quoted map for better performance
-            if constexpr (not check_unquoted(Opts)) {
-               dump('"', args...);
-            }
-            dump_maybe_empty(str, args...);
-            if constexpr (not check_unquoted(Opts)) {
-               dump('"', args...);
-            }
-         }
-         else [[unlikely]] {
-            // Value doesn't have a mapped string, serialize as underlying number
-            serialize<JSON>::op<Opts>(static_cast<std::underlying_type_t<T>>(value), ctx, std::forward<Args>(args)...);
-         }
+         detail::write_enum_name<Opts>(get_enum_name(value), ctx, b, ix);
       }
    };
 
@@ -1052,35 +1248,21 @@ namespace glz
       requires(!meta_keys<T> && std::is_enum_v<std::decay_t<T>> && !glaze_enum_t<T> && !custom_write<T>)
    struct to<JSON, T>
    {
-      static constexpr bool can_error = false;
+      // Only the reflect_enums path can error, and it exists only with P2996
+      static constexpr bool can_error = GLZ_REFLECTION26;
 
-      template <auto Opts, class... Args>
-      GLZ_ALWAYS_INLINE static void op(auto&& value, is_context auto&& ctx, Args&&... args)
+      template <auto Opts, class B>
+      GLZ_ALWAYS_INLINE static void op(auto&& value, is_context auto&& ctx, B&& b, auto& ix)
       {
 #if GLZ_REFLECTION26
          if constexpr (check_reflect_enums(Opts)) {
-            // P2996 reflection using reflect_constant_array and expansion statements
-            const sv name = enum_to_string(value);
-            if (!name.empty()) {
-               if constexpr (not check_unquoted(Opts)) {
-                  dump('"', args...);
-               }
-               dump_maybe_empty(name, args...);
-               if constexpr (not check_unquoted(Opts)) {
-                  dump('"', args...);
-               }
-            }
-            else [[unlikely]] {
-               serialize<JSON>::op<Opts>(static_cast<std::underlying_type_t<std::decay_t<T>>>(value), ctx,
-                                         std::forward<Args>(args)...);
-            }
+            detail::write_enum_name<Opts>(enum_to_string(value), ctx, b, ix);
          }
          else
 #endif
          {
             // Fallback: serialize as underlying number
-            serialize<JSON>::op<Opts>(static_cast<std::underlying_type_t<std::decay_t<T>>>(value), ctx,
-                                      std::forward<Args>(args)...);
+            serialize<JSON>::op<Opts>(static_cast<std::underlying_type_t<std::decay_t<T>>>(value), ctx, b, ix);
          }
       }
    };
@@ -1141,6 +1323,19 @@ namespace glz
             std::memcpy(&b[ix], value.str.data(), n);
             ix += n;
          }
+         else {
+            // An empty raw_json holds no JSON document, but a value is required wherever one is
+            // written. Dumping nothing truncates the enclosing document (`{"key":}`), so the empty
+            // state serializes as null. This covers a member that was never filled as well as one
+            // cleared or assigned an empty string.
+            if (!ensure_space(ctx, b, ix + 4 + write_padding_bytes)) [[unlikely]] {
+               return;
+            }
+
+            static constexpr char null_v[]{'n', 'u', 'l', 'l'};
+            std::memcpy(&b[ix], null_v, 4);
+            ix += 4;
+         }
       }
    };
 
@@ -1172,7 +1367,7 @@ namespace glz
          if constexpr (check_new_lines_in_arrays(Opts)) {
             std::memcpy(&b[ix], ",\n", 2);
             ix += 2;
-            std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+            fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
             ix += ctx.depth;
          }
          else {
@@ -1268,7 +1463,7 @@ namespace glz
                   if constexpr (check_new_lines_in_arrays(Opts)) {
                      std::memcpy(&b[ix], "[\n", 2);
                      ix += 2;
-                     std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                     fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                      ix += ctx.depth;
                   }
                   else {
@@ -1296,7 +1491,7 @@ namespace glz
                      if constexpr (check_new_lines_in_arrays(Opts)) {
                         std::memcpy(&b[ix], ",\n", 2);
                         ix += 2;
-                        std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                        fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                         ix += ctx.depth;
                      }
                      else {
@@ -1318,7 +1513,7 @@ namespace glz
                   ctx.depth -= check_indentation_width(Opts);
                   std::memcpy(&b[ix], "\n", 1);
                   ++ix;
-                  std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                  fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                   ix += ctx.depth;
                }
 
@@ -1340,7 +1535,7 @@ namespace glz
                   if constexpr (check_new_lines_in_arrays(Opts)) {
                      std::memcpy(&b[ix], "[\n", 2);
                      ix += 2;
-                     std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                     fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                      ix += ctx.depth;
                   }
                   else {
@@ -1386,7 +1581,7 @@ namespace glz
                         if constexpr (check_new_lines_in_arrays(Opts)) {
                            std::memcpy(&b[ix], ",\n", 2);
                            ix += 2;
-                           std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                           fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                            ix += ctx.depth;
                         }
                         else {
@@ -1439,14 +1634,13 @@ namespace glz
                   }
                   std::memcpy(&b[ix], "\n", 1);
                   ++ix;
-                  std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                  fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                   ix += ctx.depth;
                }
             }
 
             using val_t = detail::iterator_second_type<T>; // the type of value in each [key, value] pair
-            constexpr bool write_function_pointers = check_write_function_pointers(Opts);
-            if constexpr (!always_skipped<val_t> && (write_function_pointers || !is_any_function_ptr<val_t>)) {
+            if constexpr (!never_written<Opts, val_t>) {
                if constexpr (null_t<val_t> && Opts.skip_null_members) {
                   auto write_first_entry = [&](auto&& it) {
                      auto&& [key, entry_val] = *it;
@@ -1515,7 +1709,7 @@ namespace glz
                   }
                   std::memcpy(&b[ix], "\n", 1);
                   ++ix;
-                  std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                  fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                   ix += ctx.depth;
                }
             }
@@ -1544,7 +1738,7 @@ namespace glz
                return;
             }
             dump<false>("{\n", b, ix);
-            std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+            fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
             ix += ctx.depth;
          }
          else {
@@ -1738,7 +1932,7 @@ namespace glz
             }
             std::memcpy(&b[ix], "\n", 1);
             ++ix;
-            std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+            fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
             ix += ctx.depth;
             std::memcpy(&b[ix], "}", 1);
             ++ix;
@@ -1815,7 +2009,7 @@ namespace glz
                      }
                      std::memcpy(&b[ix], "\n", 1);
                      ++ix;
-                     std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                     fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                      ix += ctx.depth;
                      std::memcpy(&b[ix], "}", 1);
                      ++ix;
@@ -1863,7 +2057,7 @@ namespace glz
                      }
                      std::memcpy(&b[ix], "\n", 1);
                      ++ix;
-                     std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                     fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                      ix += ctx.depth;
                      std::memcpy(&b[ix], "}", 1);
                      ++ix;
@@ -1973,7 +2167,7 @@ namespace glz
                      }
                      std::memcpy(&b[ix], "\n", 1);
                      ++ix;
-                     std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                     fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                      ix += ctx.depth;
                      std::memcpy(&b[ix], "}", 1);
                      ++ix;
@@ -2162,9 +2356,7 @@ namespace glz
                return;
             }
 
-            // skip
-            constexpr bool write_function_pointers = check_write_function_pointers(Opts);
-            if constexpr (always_skipped<val_t> || (!write_function_pointers && is_any_function_ptr<val_t>)) {
+            if constexpr (never_written<Opts, val_t>) {
                return;
             }
             else {
@@ -2323,7 +2515,7 @@ namespace glz
                   }
                   std::memcpy(&b[ix], "{\n", 2);
                   ix += 2;
-                  std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                  fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                   ix += ctx.depth;
                }
                else {
@@ -2353,29 +2545,26 @@ namespace glz
                for_each<N>([&]<size_t I>() {
                   using val_t = field_t<T, I>;
 
-                  if constexpr (meta_has_skip<T>) {
-                     static constexpr meta_context mctx{.op = operation::serialize};
-                     if constexpr (meta<T>::skip(reflect<T>::keys[I], mctx)) return;
-                  }
-                  if constexpr (meta_has_skip_if<T>) {
-                     static constexpr auto key = glz::get<I>(reflect<T>::keys);
-                     static constexpr meta_context mctx{.op = operation::serialize};
-                     decltype(auto) field_value = [&]() -> decltype(auto) {
-                        if constexpr (reflectable<T>) {
-                           return get<I>(t);
-                        }
-                        else {
-                           return get_member(value, glz::get<I>(reflect<T>::values));
-                        }
-                     }();
-                     if (meta<T>::skip_if(field_value, key, mctx)) return;
-                  }
-
-                  constexpr bool write_function_pointers = check_write_function_pointers(Opts);
-                  if constexpr (always_skipped<val_t> || (!write_function_pointers && is_any_function_ptr<val_t>)) {
+                  // Compile-time exclusions gate the field here rather than returning early, so that a
+                  // skipped field's writer is never instantiated -- see `skipped_by_meta`.
+                  if constexpr (skipped_on_write<Opts, T, I>) {
                      return;
                   }
                   else {
+                     if constexpr (meta_has_skip_if<T>) {
+                        static constexpr auto skip_if_key = glz::get<I>(reflect<T>::keys);
+                        static constexpr meta_context mctx{.op = operation::serialize};
+                        decltype(auto) field_value = [&]() -> decltype(auto) {
+                           if constexpr (reflectable<T>) {
+                              return get<I>(t);
+                           }
+                           else {
+                              return get_member(value, glz::get<I>(reflect<T>::values));
+                           }
+                        }();
+                        if (meta<T>::skip_if(field_value, skip_if_key, mctx)) return;
+                     }
+
                      if constexpr (null_t<val_t> && Opts.skip_null_members) {
                         if constexpr (always_null_t<val_t>)
                            return;
@@ -2442,7 +2631,7 @@ namespace glz
                         if constexpr (Opts.prettify) {
                            std::memcpy(&b[ix], ",\n", 2);
                            ix += 2;
-                           std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                           fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                            ix += ctx.depth;
                         }
                         else {
@@ -2502,7 +2691,7 @@ namespace glz
                   if constexpr (I != 0 && Opts.prettify) {
                      std::memcpy(&b[ix], ",\n", 2);
                      ix += 2;
-                     std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                     fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                      ix += ctx.depth;
                   }
 
@@ -2561,7 +2750,7 @@ namespace glz
                   }
                   std::memcpy(&b[ix], "\n", 1);
                   ++ix;
-                  std::memset(&b[ix], check_indentation_char(Opts), ctx.depth);
+                  fill_bytes(&b[ix], check_indentation_char(Opts), ctx.depth);
                   ix += ctx.depth;
                   std::memcpy(&b[ix], "}", 1);
                   ++ix;
@@ -2581,11 +2770,11 @@ namespace glz
    // Duration: serialized generically (as the bare rep count) by the
    // to<uint32_t Format, is_duration T> specialization in core/chrono.hpp.
 
-   // system_clock::time_point: serialize as ISO 8601 string.
-   // Zero-allocation implementation writing directly to buffer. The layout is shared with
+   // system_clock / utc_clock time_point: serialize as ISO 8601 string (a utc_clock leap second
+   // as :60). Zero-allocation implementation writing directly to buffer. The layout is shared with
    // every other text format via chrono_detail::write_iso_time_point; JSON supplies the
    // quoting (a JSON scalar is a quoted string unless the caller opted out via `unquoted`).
-   template <is_system_time_point T>
+   template <is_calendar_time_point T>
       requires(not custom_write<T>)
    struct to<JSON, T>
    {
@@ -2680,7 +2869,7 @@ namespace glz
 
       if constexpr (traits::is_resizable) {
          if (buffer.size() < 2 * write_padding_bytes) {
-            buffer.resize(2 * write_padding_bytes);
+            resize_unfilled(buffer, 2 * write_padding_bytes);
          }
       }
       context ctx{};
@@ -2688,6 +2877,13 @@ namespace glz
       to_runtime_partial<std::remove_cvref_t<T>>::template op<set_json<Opts>()>(keys, std::forward<T>(value), ctx,
                                                                                 buffer, ix);
       if (bool(ctx.error)) [[unlikely]] {
+         // Truncate on the way out too: the padding above is grown without being filled, so a
+         // buffer left at its padded length would hand the caller indeterminate bytes. Not
+         // `finalize`, which for a streaming buffer means flushing -- a failed write must not
+         // push the partial document downstream on its way out.
+         if constexpr (traits::is_resizable && not traits::is_output_streaming) {
+            buffer.resize(ix);
+         }
          return {ix, ctx.error, ctx.custom_error_message};
       }
 
@@ -2734,7 +2930,7 @@ namespace glz
 
       if constexpr (traits::is_resizable) {
          if (buffer.size() < 2 * write_padding_bytes) {
-            buffer.resize(2 * write_padding_bytes);
+            resize_unfilled(buffer, 2 * write_padding_bytes);
          }
       }
       context ctx{};
@@ -2742,6 +2938,13 @@ namespace glz
       to_runtime_exclude<std::remove_cvref_t<T>>::template op<set_json<Opts>()>(exclude_keys, std::forward<T>(value),
                                                                                 ctx, buffer, ix);
       if (bool(ctx.error)) [[unlikely]] {
+         // Truncate on the way out too: the padding above is grown without being filled, so a
+         // buffer left at its padded length would hand the caller indeterminate bytes. Not
+         // `finalize`, which for a streaming buffer means flushing -- a failed write must not
+         // push the partial document downstream on its way out.
+         if constexpr (traits::is_resizable && not traits::is_output_streaming) {
+            buffer.resize(ix);
+         }
          return {ix, ctx.error, ctx.custom_error_message};
       }
 

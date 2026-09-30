@@ -269,15 +269,16 @@ Glaze requires a C++ standard conformant pre-processor, which requires the `/Zc:
 
 ### SIMD Architecture Detection
 
-Glaze automatically detects the target architecture and enables platform-specific SIMD optimizations using compiler-predefined macros:
+Glaze automatically detects the target architecture and enables platform-specific SIMD optimizations using compiler-predefined macros, covering SSE2 through AVX-512BW on x86-64, NEON on ARM, and SIMD128 on WebAssembly. Since these are target-architecture macros set by the compiler, cross-compilation works automatically (e.g., an x86 host cross-compiling for ARM will not enable x86 SIMD paths). See [Optimizing Performance](./docs/optimizing-performance.md#simd-architecture-flags) for the full table.
 
-| Flag | Detected When | Architecture |
-|------|--------------|--------------|
-| `GLZ_USE_SSE2` | `__x86_64__` or `_M_X64` | x86-64 (always has SSE2) |
-| `GLZ_USE_AVX2` | `__AVX2__` (in addition to x86-64) | x86-64 with AVX2 |
-| `GLZ_USE_NEON` | `__aarch64__`, `_M_ARM64`, or `__ARM_NEON` | ARM64 / AArch64 |
+To report what a build actually compiled, read `glz::simd_info`:
 
-Since these are target-architecture macros set by the compiler, cross-compilation works automatically (e.g., an x86 host cross-compiling for ARM will not enable x86 SIMD paths).
+```c++
+std::string report;
+std::ignore = glz::write_json(glz::simd_info, report);
+// {"detected":"AVX512BW","utf8_validation":"AVX512BW","string_escape":"AVX2",
+//  "float_write":"SSE4.1","structural_skip":"AVX512BW"}
+```
 
 To disable SIMD optimizations:
 
@@ -865,7 +866,7 @@ This is useful for:
 
 # Input Buffer (Null) Termination
 
-A non-const `std::string` is recommended for input buffers, as this allows Glaze to improve performance with temporary padding and the buffer will be null terminated.
+A `std::string` is recommended for input buffers, because it carries the null terminator the default `null_terminated` option expects. Glaze reads the buffer you give it and does not modify it, so a `const std::string&` or a `std::string_view` over one is equally fast. A buffer that keeps no terminator of its own -- a `std::vector<char>`, or a container shaped like `QByteArray` -- is read with bounds instead, at a small cost.
 
 ## JSON
 
@@ -1214,6 +1215,8 @@ By default Glaze is strictly conformant with the latest JSON standard except in 
   This option does full JSON validation for skipped values when parsing. This is not set by default because values are typically skipped when the user is unconcerned with them, and Glaze still validates for major issues. But, this makes skipping faster by not caring if the skipped values are exactly JSON conformant. For example, by default Glaze will ensure skipped numbers have all valid numerical characters, but it will not validate for issues like leading zeros in skipped numbers unless `validate_skipped` is on. Wherever Glaze parses a value to be used it is fully validated.
 - `validate_trailing_whitespace`
   This option validates the trailing whitespace in a parsed document. Because Glaze parses C++ structs, there is typically no need to continue parsing after the object of interest has been read. Turn on this option if you want to ensure that the rest of the document has valid whitespace, otherwise Glaze will just ignore the content after the content of interest has been parsed.
+
+UTF-8 encoding is validated on read, as RFC 8259 section 8.1 requires. The `validate_utf8` option turns this off for input whose encoding is already guaranteed, at the cost of conformance. See [UTF-8 Validation](https://stephenberry.github.io/glaze/json/#utf-8-validation).
 
 > [!NOTE]
 >

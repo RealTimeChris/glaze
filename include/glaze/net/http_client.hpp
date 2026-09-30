@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -16,21 +17,21 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <shared_mutex>
 #include <source_location>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "glaze/ext/glaze_asio.hpp"
+#include "glaze/net/http_headers.hpp"
 #include "glaze/net/http_router.hpp"
+#include "glaze/net/ssl.hpp"
 #include "glaze/util/env.hpp"
 #include "glaze/util/itoa.hpp"
 #include "glaze/util/key_transformers.hpp"
-
-#ifdef GLZ_ENABLE_SSL
-#include <openssl/ssl.h> // For SSL_set_tlsext_host_name
-#endif
 
 namespace glz
 {
@@ -67,71 +68,18 @@ namespace glz
    // Socket type aliases for HTTP client
    using tcp_socket = asio::ip::tcp::socket;
 #ifdef GLZ_ENABLE_SSL
-   using ssl_socket = asio::ssl::stream<asio::ip::tcp::socket>;
    using socket_variant = std::variant<std::shared_ptr<tcp_socket>, std::shared_ptr<ssl_socket>>;
 #else
    using socket_variant = std::variant<std::shared_ptr<tcp_socket>>;
 #endif
 
-   // SSL error codes for detailed error reporting
-   enum class ssl_error {
-      success = 0,
-      ssl_not_supported, // HTTPS requested but SSL support not compiled in
-      sni_hostname_failed // Failed to set SNI hostname (SSL_set_tlsext_host_name)
-      // Note: Handshake and certificate errors propagate as native ASIO/OpenSSL error codes
-      // for more detailed error information
-   };
-
-   // SSL error category for std::error_code integration
-   class ssl_error_category : public std::error_category
-   {
-     public:
-      const char* name() const noexcept override { return "glaze.ssl"; }
-
-      std::string message(int ev) const override
-      {
-         switch (static_cast<ssl_error>(ev)) {
-         case ssl_error::success:
-            return "Success";
-         case ssl_error::ssl_not_supported:
-            return "SSL/TLS not supported: GLZ_ENABLE_SSL not defined";
-         case ssl_error::sni_hostname_failed:
-            return "Failed to set SNI hostname for TLS connection";
-         default:
-            return "Unknown SSL error";
-         }
-      }
-
-      // Map to equivalent standard error conditions where applicable
-      std::error_condition default_error_condition(int ev) const noexcept override
-      {
-         switch (static_cast<ssl_error>(ev)) {
-         case ssl_error::ssl_not_supported:
-            return std::errc::protocol_not_supported;
-         case ssl_error::sni_hostname_failed:
-            return std::errc::protocol_error;
-         default:
-            return std::error_condition(ev, *this);
-         }
-      }
-   };
-
-   // Get the singleton instance of the SSL error category
-   inline const ssl_error_category& get_ssl_error_category() noexcept
-   {
-      static ssl_error_category instance;
-      return instance;
-   }
-
-   // Create std::error_code from ssl_error
-   inline std::error_code make_error_code(ssl_error e) noexcept
-   {
-      return {static_cast<int>(e), get_ssl_error_category()};
-   }
    // HTTP client error codes
    enum class http_client_error {
       success = 0,
       response_too_large, // Response body exceeds max_response_body_size
+      unframed_response, // Response Content-Length is malformed or repeats with conflicting values
+      too_many_redirects, // Redirect chain exceeded max_redirects()
+      invalid_redirect, // A 3xx response's Location is missing, empty, or not resolvable to an HTTP(S) target
    };
 
    // HTTP client error category for std::error_code integration
@@ -147,6 +95,12 @@ namespace glz
             return "Success";
          case http_client_error::response_too_large:
             return "Response body size exceeds configured maximum";
+         case http_client_error::unframed_response:
+            return "Response Content-Length is malformed or repeats with conflicting values";
+         case http_client_error::too_many_redirects:
+            return "Redirect chain exceeded the configured maximum";
+         case http_client_error::invalid_redirect:
+            return "Redirect response has a missing or unusable Location";
          default:
             return "Unknown HTTP client error";
          }
@@ -164,11 +118,6 @@ namespace glz
       return {static_cast<int>(e), get_http_client_error_category()};
    }
 } // namespace glz
-
-// Enable automatic conversion from glz::ssl_error to std::error_code
-template <>
-struct std::is_error_code_enum<glz::ssl_error> : std::true_type
-{};
 
 template <>
 struct std::is_error_code_enum<glz::http_client_error> : std::true_type
@@ -260,10 +209,41 @@ namespace glz
       // body or re-iterating the headers map. For large idempotent PUT bodies this is
       // the difference between O(1) and O(N) body copies per request through the chain.
       inline std::string build_http_request_bytes(const std::string& method, const url_parts& url, bool use_https,
-                                                  const std::string& body,
-                                                  const std::unordered_map<std::string, std::string>& headers)
+                                                  const std::string& body, const glz::http_headers& headers)
       {
          const bool is_default_port = (!use_https && url.port == 80) || (use_https && url.port == 443);
+
+         // This builder owns the single Host and Connection field on the wire, the
+         // same way it owns the body framing below. A caller's value replaces the
+         // writer's default instead of riding alongside it, and only the first
+         // usable one is kept: RFC 9112 3.2 admits exactly one Host, and a second
+         // one lets an intermediary and the origin resolve the same request to
+         // different authorities (request smuggling) - glaze's own server answers a
+         // repeat with 400. Connection is likewise reduced to one field, since a
+         // "close" and a "keep-alive" on the same message leave each hop to pick a
+         // different connection lifetime. glz::http_headers keeps repeats, so a
+         // single lookup would not have caught the second one.
+         //
+         // A field carrying CR or LF is not usable, because the loop below drops it
+         // rather than write a split message. Taking one here would suppress the
+         // writer's default and send an HTTP/1.1 request with no Host at all.
+         const std::string* caller_host = nullptr;
+         const std::string* caller_connection = nullptr;
+         for (const auto& [name, value] : headers) {
+            if (header_field_has_crlf(name, value)) [[unlikely]] {
+               continue;
+            }
+            if (glz::striequal(name, "host")) {
+               if (!caller_host) {
+                  caller_host = &value;
+               }
+            }
+            else if (glz::striequal(name, "connection")) {
+               if (!caller_connection) {
+                  caller_connection = &value;
+               }
+            }
+         }
 
          std::string request_str;
          request_str.reserve(512 + body.size());
@@ -271,24 +251,60 @@ namespace glz
          request_str.append(" ");
          request_str.append(url.path);
          request_str.append(" HTTP/1.1\r\n");
+         // RFC 9112 5: a user agent SHOULD generate Host as the first field after
+         // the request-line, so a caller's value is written in this slot rather
+         // than wherever it happened to sit among their headers.
          request_str.append("Host: ");
-         request_str.append(url.host);
-         if (!is_default_port) {
-            char
-               port_buf[8]; // a uint16_t port is at most 5 digits; pad so the sizing does not depend on itoa internals
-            auto* end = glz::to_chars(port_buf, url.port);
-            request_str.push_back(':');
-            request_str.append(port_buf, static_cast<size_t>(end - port_buf));
+         if (caller_host) {
+            request_str.append(*caller_host);
+         }
+         else {
+            request_str.append(url.host);
+            if (!is_default_port) {
+               // A uint16_t port is at most 5 digits; pad so the sizing does not depend on itoa internals
+               char port_buf[8];
+               auto* end = glz::to_chars(port_buf, url.port);
+               request_str.push_back(':');
+               request_str.append(port_buf, static_cast<size_t>(end - port_buf));
+            }
          }
          request_str.append("\r\n");
-         request_str.append("Connection: keep-alive\r\n");
-         if (!body.empty()) {
+         request_str.append("Connection: ");
+         request_str.append(caller_connection ? std::string_view{*caller_connection} : "keep-alive");
+         request_str.append("\r\n");
+         // RFC 9110 8.6: a user agent SHOULD send Content-Length when the method
+         // anticipates content, even for an empty body - origin servers and proxies
+         // commonly answer a bodyless POST with 411 Length Required. Since a caller's
+         // own Content-Length is dropped below, omitting it here would leave them no
+         // way to frame an empty POST at all. For a method that anticipates no
+         // content, no field is the unambiguous encoding of an empty body
+         // (RFC 9112 6), so adding one would only invite a body where none belongs.
+         const bool anticipates_content = method == "POST" || method == "PUT" || method == "PATCH";
+         if (!body.empty() || anticipates_content) {
             request_str.append("Content-Length: ");
             request_str.append(std::to_string(body.size()));
             request_str.append("\r\n");
          }
          for (const auto& [name, value] : headers) {
             if (header_field_has_crlf(name, value)) [[unlikely]] {
+               continue;
+            }
+            // This builder owns the body framing: it has already written the
+            // Content-Length that matches the body it is about to append. A
+            // caller-supplied Content-Length or Transfer-Encoding would ride
+            // alongside it as a second, contradicting frame - and unlike the
+            // response side there is no correct value to keep, because the body
+            // length is whatever this function writes. Drop them rather than
+            // emit a request no two recipients would parse the same way
+            // (RFC 9112 6.3, request smuggling). glz::http_headers keeps
+            // repeats, so a single lookup would not have caught the second one.
+            if (header_field_frames_body(name)) [[unlikely]] {
+               continue;
+            }
+            // Host and Connection were resolved above and written once; whatever
+            // the caller supplied is already on the wire (or was rejected there),
+            // so every field of either name is skipped here.
+            if (glz::striequal(name, "host") || glz::striequal(name, "connection")) {
                continue;
             }
             request_str.append(name);
@@ -301,98 +317,79 @@ namespace glz
          return request_str;
       }
 
-#ifdef GLZ_ENABLE_SSL
-      // Configure SNI and hostname verification for client TLS connections.
-      inline bool configure_ssl_client_hostname(ssl_socket& sock, const std::string& host)
+      // Outcome of reading the Content-Length of a response. `absent` and
+      // `unframed` are distinct because they lead to different reads: no
+      // Content-Length at all is a legitimate response whose body runs to the end
+      // of the connection, whereas one we cannot resolve to a single length has to
+      // fail the request.
+      enum struct content_length_state { absent, present, unframed };
+
+      struct parsed_content_length
       {
-         if (!SSL_set_tlsext_host_name(sock.native_handle(), host.c_str())) {
-            return false;
-         }
-
-         sock.set_verify_callback(asio::ssl::host_name_verification(host));
-         return true;
-      }
-
-      enum class ssl_ca_source { explicit_file, env_ssl_cert_file, env_ssl_cert_dir, default_verify_paths };
-
-      inline std::optional<std::string_view> non_empty_path(std::optional<std::string_view> value)
-      {
-         if (value && !value->empty()) {
-            return value;
-         }
-         return std::nullopt;
-      }
-
-      inline std::optional<std::string> env_path(const char* name) { return getenv_nonempty(name); }
-
-      inline std::optional<std::string_view> to_sv_opt(const std::optional<std::string>& value)
-      {
-         if (value && !value->empty()) {
-            return std::string_view{*value};
-         }
-         return std::nullopt;
-      }
-
-      std::optional<std::string_view> to_sv_opt(std::optional<std::string>&&) = delete;
-
-      template <typename Loader>
-      concept ssl_ca_path_loader = requires(Loader&& loader, std::string_view path) {
-         { std::forward<Loader>(loader)(path) } -> std::convertible_to<std::error_code>;
+         content_length_state state{content_length_state::absent};
+         size_t value{};
       };
 
-      template <typename Loader>
-      concept ssl_ca_default_loader = requires(Loader&& loader) {
-         { std::forward<Loader>(loader)() } -> std::convertible_to<std::error_code>;
-      };
-
-      template <ssl_ca_path_loader LoadFile, ssl_ca_path_loader LoadDir, ssl_ca_default_loader LoadDefault>
-      inline std::expected<ssl_ca_source, std::error_code> configure_ssl_ca_fallback(
-         std::optional<std::string_view> explicit_file, std::optional<std::string_view> env_cert_file,
-         std::optional<std::string_view> env_cert_dir, LoadFile&& load_file, LoadDir&& load_dir,
-         LoadDefault&& load_default)
+      // RFC 9112 6.3: a response whose Content-Length fields disagree has no
+      // recoverable body length. Picking one - first or last - lets a proxy that
+      // picked the other resume framing at a different offset, so the bytes this
+      // client reads as the start of the next response are chosen by whoever
+      // supplied the second field (response smuggling). Repeats that resolve to the
+      // same length are unambiguous and tolerated, in the same spirit as the
+      // server's rule for a request - though the server compares the raw field
+      // text, so it rejects the "3" and "03" pair this accepts. Both readings frame
+      // the body identically; only the strictness differs.
+      //
+      // A value that is not a bare decimal is rejected for the same reason: it
+      // resolves to no length at all, and defaulting it to zero would leave a real
+      // body sitting in the socket to be read as the next response.
+      [[nodiscard]] inline parsed_content_length read_content_length(const glz::http_headers& headers)
       {
-         std::optional<std::error_code> last_error{};
-
-         const auto try_file = [&](std::optional<std::string_view> path,
-                                   ssl_ca_source source) -> std::optional<ssl_ca_source> {
-            if (auto non_empty = non_empty_path(path)) {
-               if (const std::error_code ec = load_file(*non_empty); ec) {
-                  last_error = ec;
-               }
-               else {
-                  return source;
-               }
-            }
-            return std::nullopt;
-         };
-
-         if (auto source = try_file(explicit_file, ssl_ca_source::explicit_file)) {
-            return *source;
+         // RFC 9112 6.3: Transfer-Encoding overrides Content-Length, so a chunked
+         // response is framed by the chunk sizes and its Content-Length is never
+         // consulted. A field this client will not use must not be able to fail the
+         // request either - the framing is already unambiguous without it. Reporting
+         // `absent` says exactly that: there is no Content-Length framing to apply,
+         // whether or not such a field was sent.
+         //
+         // This also keeps the two framings from ever being weighed against each
+         // other. Whether a Content-Length parses cannot change how a chunked body
+         // is read, so the order these are evaluated in stops mattering.
+         if (headers.contains_token("Transfer-Encoding", "chunked")) {
+            return {content_length_state::absent, 0};
          }
 
-         if (auto source = try_file(env_cert_file, ssl_ca_source::env_ssl_cert_file)) {
-            return *source;
+         parsed_content_length result{};
+
+         for (const auto field_value : headers.values("Content-Length")) {
+            size_t length{};
+            const char* const first = field_value.data();
+            const char* const last = first + field_value.size();
+            const auto [stopped_at, ec] = std::from_chars(first, last, length);
+            if (ec != std::errc{} || stopped_at != last) {
+               return {content_length_state::unframed, 0};
+            }
+
+            if (result.state == content_length_state::absent) {
+               result = {content_length_state::present, length};
+            }
+            else if (result.value != length) {
+               return {content_length_state::unframed, 0};
+            }
          }
 
-         if (auto non_empty = non_empty_path(env_cert_dir)) {
-            if (const std::error_code ec = load_dir(*non_empty); ec) {
-               last_error = ec;
-            }
-            else {
-               return ssl_ca_source::env_ssl_cert_dir;
-            }
-         }
-
-         if (const std::error_code ec = load_default(); ec) {
-            if (last_error) {
-               return std::unexpected(*last_error);
-            }
-            return std::unexpected(ec);
-         }
-
-         return ssl_ca_source::default_verify_paths;
+         return result;
       }
-#endif
+
+      // Sets the Content-Type header to application/json if the Content-Type
+      // header is not already set.
+      inline glz::http_headers with_json_content_type(glz::http_headers headers)
+      {
+         if (!headers.contains("Content-Type")) {
+            headers.add("Content-Type", "application/json");
+         }
+         return headers;
+      }
 
       // Helper to close a socket variant with optional SSL shutdown
       // graceful_shutdown: if true, performs SSL shutdown before closing (recommended for proper TLS termination)
@@ -507,6 +504,247 @@ namespace glz
       }
 
       return url_parts{std::move(protocol), std::move(host), port, std::move(path)};
+   }
+
+   namespace detail
+   {
+      // RFC 3986 5.2.4: collapse the "." and ".." segments of an absolute path, so a
+      // Location of "../v2/thing" becomes a request-target the next server can route rather
+      // than one it answers with 400. Any query string must already be split off by the
+      // caller.
+      inline std::string remove_dot_segments(std::string_view path)
+      {
+         std::string output;
+         output.reserve(path.size());
+
+         while (!path.empty()) {
+            if (path.starts_with("../")) {
+               path.remove_prefix(3);
+            }
+            else if (path.starts_with("./")) {
+               path.remove_prefix(2);
+            }
+            else if (path.starts_with("/./")) {
+               path.remove_prefix(2); // leaves the "/" as the start of the next segment
+            }
+            else if (path == "/.") {
+               // Steps 2B and 2C replace the prefix with "/", so the trailing slash
+               // survives into the output: "/a/b/." resolves to "/a/b/", not "/a/b".
+               path.remove_suffix(1);
+            }
+            else if (path.starts_with("/../") || path == "/..") {
+               if (path.size() == 3) {
+                  path.remove_suffix(2);
+               }
+               else {
+                  path.remove_prefix(3);
+               }
+               // Walking above the root is not an error: RFC 3986 5.4.2 resolves it by
+               // discarding the extra step rather than rejecting the reference.
+               if (auto slash = output.rfind('/'); slash != std::string::npos) {
+                  output.resize(slash);
+               }
+               else {
+                  output.clear();
+               }
+            }
+            else if (path == "." || path == "..") {
+               path = {};
+            }
+            else {
+               // Move one segment - the leading "/" plus everything up to the next "/" - across.
+               const size_t next = path.find('/', path.starts_with("/") ? 1 : 0);
+               const size_t count = (next == std::string_view::npos) ? path.size() : next;
+               output.append(path.substr(0, count));
+               path.remove_prefix(count);
+            }
+         }
+
+         return output.empty() ? std::string{"/"} : output;
+      }
+   }
+
+   // RFC 3986 5.2/5.3: resolve a Location field against the URL the response came from.
+   // Location is allowed to be an absolute URL, scheme-relative ("//host/path"),
+   // root-relative ("/path"), a query-only reference ("?page=2"), or a relative reference
+   // ("thing"), and servers send all of these in practice.
+   inline std::expected<url_parts, std::error_code> resolve_redirect_url(const url_parts& base,
+                                                                         std::string_view location)
+   {
+      // A fragment identifies a part of the retrieved representation and never travels on
+      // the wire, so it is dropped before the reference is resolved (RFC 9110 10.2.2).
+      if (const auto hash = location.find('#'); hash != std::string_view::npos) {
+         location = location.substr(0, hash);
+      }
+      if (location.empty()) {
+         return std::unexpected(make_error_code(http_client_error::invalid_redirect));
+      }
+
+      // An absolute reference starts with "scheme://", but "/r?to=http://elsewhere" does
+      // not: the "://" only means a scheme when nothing else comes first.
+      const size_t scheme_end = location.find("://");
+      const bool is_absolute = scheme_end != std::string_view::npos && scheme_end == location.find_first_of(":/?");
+
+      // Seeded with the failure every branch below would otherwise have to spell out, so
+      // no branch can leave a half-formed url_parts behind.
+      std::expected<url_parts, std::error_code> resolved =
+         std::unexpected(make_error_code(http_client_error::invalid_redirect));
+      if (is_absolute) {
+         // A scheme is case-insensitive (RFC 3986 3.1) but parse_url matches it literally,
+         // so a "HTTPS://..." Location is normalized rather than rejected.
+         std::string absolute{location};
+         for (size_t i = 0; i < scheme_end; ++i) {
+            absolute[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(absolute[i])));
+         }
+         resolved = parse_url(absolute);
+      }
+      else if (location.starts_with("//")) {
+         resolved = parse_url(base.protocol + ":" + std::string(location));
+      }
+      else {
+         // Same origin; only the target within it changes.
+         std::string_view reference_path = location;
+         std::string_view reference_query;
+         if (const auto question = reference_path.find('?'); question != std::string_view::npos) {
+            reference_query = reference_path.substr(question);
+            reference_path = reference_path.substr(0, question);
+         }
+
+         const std::string_view base_path = split_target(base.path).path;
+
+         std::string merged;
+         if (reference_path.empty()) {
+            // A query-only reference keeps the base path whole rather than merging
+            // against its parent directory (RFC 3986 5.2.2).
+            merged = std::string(base_path);
+         }
+         else if (reference_path.starts_with('/')) {
+            merged = std::string(reference_path);
+         }
+         else {
+            const auto last_slash = base_path.rfind('/');
+            merged = (last_slash == std::string_view::npos) ? std::string{"/"}
+                                                            : std::string(base_path.substr(0, last_slash + 1));
+            merged.append(reference_path);
+         }
+
+         std::string path = detail::remove_dot_segments(merged);
+         path.append(reference_query);
+         resolved = url_parts{base.protocol, base.host, base.port, std::move(path)};
+      }
+
+      if (!resolved) {
+         return std::unexpected(make_error_code(http_client_error::invalid_redirect));
+      }
+      // ws/wss parse as URLs but name a different protocol; an HTTP response cannot
+      // redirect a request onto one.
+      if (resolved->protocol != "http" && resolved->protocol != "https") {
+         return std::unexpected(make_error_code(http_client_error::invalid_redirect));
+      }
+      // The path goes straight into the next request line and the host into its Host
+      // field, and both of them came from the server rather than the caller. A CTL in
+      // either would split the message itself (CWE-113), and a space in a host resolves
+      // to nothing a name lookup could use, so neither is a target worth sending.
+      const auto has_control = [](std::string_view field) {
+         return std::ranges::any_of(field, [](unsigned char c) { return c < 0x20 || c == 0x7f; });
+      };
+      if (has_control(resolved->path) || has_control(resolved->host) || resolved->host.find(' ') != std::string::npos) {
+         return std::unexpected(make_error_code(http_client_error::invalid_redirect));
+      }
+
+      // A space is not legal in a URI (RFC 3986 2) and would split the request line into a
+      // different request than the one intended, but servers do emit unencoded spaces and
+      // every other user agent percent-encodes rather than abandon the hop over it.
+      if (resolved->path.find(' ') != std::string::npos) {
+         std::string encoded;
+         encoded.reserve(resolved->path.size() + 16);
+         for (const char c : resolved->path) {
+            if (c == ' ') {
+               encoded.append("%20");
+            }
+            else {
+               encoded.push_back(c);
+            }
+         }
+         resolved->path = std::move(encoded);
+      }
+
+      return resolved;
+   }
+
+   // 300 (Multiple Choices) names no single target to follow and 305 (Use Proxy) was
+   // deprecated for being unsafe to act on; 304 is not a redirect at all.
+   inline bool is_redirect_status(int status_code) noexcept
+   {
+      return status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308;
+   }
+
+   namespace detail
+   {
+      // The request as it stands at one point in a redirect chain. Both the sync and async
+      // paths carry one of these so the hop rules below are written once.
+      struct redirect_request
+      {
+         std::string method;
+         url_parts url;
+         std::string body;
+         glz::http_headers headers;
+         size_t hops = 0;
+      };
+
+      // Rewrite `request` into the follow-up the 3xx response asks for, or say why the hop
+      // cannot be taken. The hop limit lives here rather than in each caller so the sync
+      // and async paths cannot drift apart on what counts as a hop.
+      inline std::expected<void, std::error_code> apply_redirect(const response& resp, redirect_request& request,
+                                                                 size_t max_hops)
+      {
+         if (request.hops >= max_hops) {
+            return std::unexpected(make_error_code(http_client_error::too_many_redirects));
+         }
+
+         const auto location = resp.response_headers.first_value("Location");
+         if (!location) {
+            return std::unexpected(make_error_code(http_client_error::invalid_redirect));
+         }
+
+         auto target = resolve_redirect_url(request.url, *location);
+         if (!target) {
+            return std::unexpected(target.error());
+         }
+
+         // Credentials are scoped to the origin they were issued for. A redirect that changes
+         // scheme, host or port hands the next request to a different party, so the fields
+         // that authenticate the caller do not travel with it - curl's CVE-2018-1000007 was
+         // exactly this leak. A caller-pinned Host belonged to the old origin too, and
+         // keeping it would send the new origin a request addressed to the old one.
+         const bool same_origin = glz::striequal(target->host, request.url.host) && target->port == request.url.port &&
+                                  target->protocol == request.url.protocol;
+         if (!same_origin) {
+            request.headers.erase("Authorization");
+            request.headers.erase("Proxy-Authorization");
+            request.headers.erase("Cookie");
+            request.headers.erase("Host");
+         }
+
+         // RFC 9110 15.4.4/15.4.8: 303 always continues as GET, and for 301/302 every
+         // deployed user agent rewrites POST to GET - a server that sends one to a browser is
+         // relying on that. 307 and 308 exist precisely to preserve the method, so they do.
+         const bool continue_as_get =
+            (resp.status_code == 303 && request.method != "GET" && request.method != "HEAD") ||
+            ((resp.status_code == 301 || resp.status_code == 302) && request.method == "POST");
+         if (continue_as_get) {
+            request.method = "GET";
+            request.body.clear();
+            // Body framing belongs to the request writer, which recomputes it from the now
+            // empty body; the media type is the caller's and would describe a body that is
+            // no longer being sent.
+            request.headers.erase("Content-Type");
+         }
+
+         request.url = std::move(*target);
+         ++request.hops;
+         return {};
+      }
    }
 
    // Idempotent HTTP methods are safe to retry transparently when a pooled connection
@@ -643,13 +881,16 @@ namespace glz
       http_connection_pool(asio::any_io_executor executor) : io_executor(executor)
       {
 #ifdef GLZ_ENABLE_SSL
-         // Use tls_client to allow negotiation of TLS 1.2/1.3 (highest mutually supported version)
-         // This automatically disables insecure protocols (SSLv3, TLS 1.0, TLS 1.1)
+         // Use tls_client so the handshake negotiates the highest mutually supported version
+         // (TLS 1.2 or TLS 1.3). asio sets the floor for tls_client to TLS 1.0, so the
+         // protocols deprecated by RFC 8996 are disabled explicitly here rather than assumed;
+         // on a default build OpenSSL's security level also rejects them, but that backstop
+         // disappears the moment a caller lowers the level through configure_ssl_context.
          ssl_context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls_client);
-         // Best effort: if default trust paths are not available on this platform,
-         // callers can still configure explicit trust roots later.
-         asio::error_code ec;
-         ssl_context->set_default_verify_paths(ec);
+         ssl_context->set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2 |
+                                  asio::ssl::context::no_sslv3 | asio::ssl::context::no_tlsv1 |
+                                  asio::ssl::context::no_tlsv1_1);
+         detail::seed_platform_trust_anchors(*ssl_context);
          ssl_context->set_verify_mode(asio::ssl::verify_peer);
 #endif
       }
@@ -825,6 +1066,32 @@ namespace glz
          func(*ssl_context);
       }
 
+      // Trust-anchor configuration. See the http_client methods of the same names for the
+      // documented behavior; these are the locking wrappers around it.
+      std::expected<void, std::error_code> add_ca_certificate_file(std::string_view path)
+      {
+         std::unique_lock<std::shared_mutex> lock(ssl_mtx);
+         return detail::add_ca_file(*ssl_context, path);
+      }
+
+      std::expected<void, std::error_code> add_ca_certificate_directory(std::string_view path)
+      {
+         std::unique_lock<std::shared_mutex> lock(ssl_mtx);
+         return detail::add_ca_directory(*ssl_context, path);
+      }
+
+      std::expected<void, std::error_code> add_ca_certificates_pem(std::string_view pem)
+      {
+         std::unique_lock<std::shared_mutex> lock(ssl_mtx);
+         return detail::add_ca_pem(*ssl_context, pem);
+      }
+
+      std::expected<size_t, std::error_code> add_os_ca_certificates()
+      {
+         std::unique_lock<std::shared_mutex> lock(ssl_mtx);
+         return detail::load_os_ca_certificates(*ssl_context);
+      }
+
       // Configure CA trust roots for server certificate verification.
       // Fallback order:
       // 1) explicit cert bundle path (if provided)
@@ -836,8 +1103,8 @@ namespace glz
       {
          std::unique_lock<std::shared_mutex> lock(ssl_mtx);
 
-         const auto env_cert_file = detail::env_path("SSL_CERT_FILE");
-         const auto env_cert_dir = detail::env_path("SSL_CERT_DIR");
+         const auto env_cert_file = getenv_nonempty("SSL_CERT_FILE");
+         const auto env_cert_dir = getenv_nonempty("SSL_CERT_DIR");
 
          auto result = detail::configure_ssl_ca_fallback(
             cert_bundle_file, detail::to_sv_opt(env_cert_file), detail::to_sv_opt(env_cert_dir),
@@ -881,6 +1148,14 @@ namespace glz
       std::function<void(std::error_code ec)>; // May carry HTTP statuses via http_status_category()
    using http_connect_handler = std::function<void(const response& headers)>;
    using http_disconnect_handler = std::function<void()>;
+   // Reports how much of the response body has been delivered so far. `total` is the size
+   // the response framed itself with, or 0 when that size is not knowable in advance - a
+   // chunked body, or one framed by connection close. Called once with (0, total) as soon
+   // as the headers are parsed, so a caller has the total before any body arrives, and
+   // again after every span handed to on_data. Returning false cancels the transfer: the
+   // stream stops where it is, the socket is closed rather than pooled, and on_disconnect
+   // follows as it would for a caller-initiated disconnect().
+   using http_progress_handler = std::function<bool(size_t transferred, size_t total)>;
 
    // Streaming HTTP connection handle
    struct http_stream_connection
@@ -890,9 +1165,32 @@ namespace glz
       std::shared_ptr<asio::streambuf> buffer; // Use unified streambuf for all reads
       bool is_connected{false};
       std::atomic<bool> should_stop{false};
+      // Set only once the response has been read to its framed end - terminal chunk,
+      // trailer section and the final CRLF all consumed - leaving the socket
+      // positioned at the start of whatever the server sends next. Every other way a
+      // stream ends - a timeout, a caller-initiated disconnect part way through the
+      // body, a read error, or a body framed by connection close - leaves either
+      // unread response bytes or a dead peer behind, so the socket must be closed
+      // rather than handed to the next request.
+      std::atomic<bool> response_complete{false};
+      // The response asked for the connection to be closed once it is delivered, so
+      // the socket is single-use no matter how cleanly the body ends.
+      std::atomic<bool> peer_will_close{false};
       stream_read_strategy strategy{stream_read_strategy::bulk_transfer}; // Default strategy
       std::function<bool(int)> status_is_error{}; // Evaluated before treating status as failure
+      http_progress_handler on_progress{}; // Reports body bytes delivered; returning false cancels
       bool is_https{false}; // Track if this is an HTTPS connection
+      bool head_request{false}; // A HEAD reply is framed as if it had a body, but carries none
+
+      // The body size the response framed itself with, fixed once the headers are parsed,
+      // and how much of it has been delivered. Empty when nothing frames the body in
+      // advance - a chunked body, or one framed by connection close - which is also the
+      // case that reports a total of 0. Both are touched only from the connection's own
+      // read chain, which asio serializes, so neither needs to be atomic; status_is_error
+      // and on_progress are likewise read from that chain and must not be reassigned once
+      // the stream is running.
+      std::optional<size_t> content_length{};
+      size_t bytes_received{};
 
       // Constructor with optional buffer size limit and strategy
       http_stream_connection(size_t max_buffer_size = 1024 * 1024,
@@ -937,7 +1235,7 @@ namespace glz
       http_error_handler on_error;
       std::string method{"GET"};
       std::string body{};
-      std::unordered_map<std::string, std::string> headers{};
+      glz::http_headers headers{};
       http_connect_handler on_connect{};
       http_disconnect_handler on_disconnect{};
       std::chrono::seconds timeout{std::chrono::seconds{30}};
@@ -955,11 +1253,17 @@ namespace glz
       stream_read_strategy strategy{stream_read_strategy::bulk_transfer};
       size_t max_buffer_size{1024 * 1024};
       std::string body;
-      std::unordered_map<std::string, std::string> headers;
-      http_connect_handler on_connect;
-      http_disconnect_handler on_disconnect;
+      glz::http_headers headers;
+      // Declared in the order callers reach for them. Designators must appear in
+      // declaration order (gcc and MSVC enforce this; clang accepts any order as an
+      // extension), so the spelling that comes naturally - the data path of on_data,
+      // on_error and on_progress first, the on_connect and on_disconnect bookends
+      // after - has to be the declared one.
       http_data_handler on_data;
       http_error_handler on_error;
+      http_progress_handler on_progress;
+      http_connect_handler on_connect;
+      http_disconnect_handler on_disconnect;
       std::function<bool(int)> status_is_error{[](int status) { return status >= 400; }};
    };
 
@@ -1039,6 +1343,48 @@ namespace glz
          connection_pool->configure_ssl_context(std::forward<Func>(func));
       }
 
+      // Add the certificates in a PEM bundle file to the set of trusted CAs (thread-safe).
+      // Additive: existing trust anchors, including those loaded at construction, are kept.
+      // Example: client.add_ca_certificate_file("cacert.pem");
+      std::expected<void, std::error_code> add_ca_certificate_file(std::string_view path)
+      {
+         return connection_pool->add_ca_certificate_file(path);
+      }
+
+      // Add an OpenSSL-style hashed certificate directory to the set of trusted CAs.
+      // The directory must be indexed with c_rehash/`openssl rehash`.
+      //
+      // A bad path is not reported here: OpenSSL reads the directory lazily during the
+      // handshake, so it surfaces as a verification failure instead. Prefer
+      // add_ca_certificate_file() when you want the path validated up front.
+      //
+      // Unlike the other adders, call this before issuing any request. OpenSSL appends to
+      // the lookup list without a lock and reads that list unlocked during verification,
+      // so adding a directory while a handshake is in flight is a race inside OpenSSL that
+      // no lock on this side can close.
+      std::expected<void, std::error_code> add_ca_certificate_directory(std::string_view path)
+      {
+         return connection_pool->add_ca_certificate_directory(path);
+      }
+
+      // Add trusted CAs from an in-memory PEM bundle (thread-safe). Accepts any number of
+      // concatenated PEM certificates, so a trust bundle can be embedded in the binary
+      // instead of shipped as a file next to it.
+      // Example: client.add_ca_certificates_pem(embedded_cacert_pem);
+      std::expected<void, std::error_code> add_ca_certificates_pem(std::string_view pem)
+      {
+         return connection_pool->add_ca_certificates_pem(pem);
+      }
+
+      // Add the operating system's native trust anchors, returning how many were added
+      // (thread-safe). Windows only; returns 0 on platforms where OpenSSL's default verify
+      // paths already resolve to the system bundle. The constructor already does this, so
+      // it is only needed to restore OS trust after replacing the context's anchors.
+      std::expected<size_t, std::error_code> add_os_ca_certificates()
+      {
+         return connection_pool->add_os_ca_certificates();
+      }
+
       // Configure CA trust roots with explicit/env/default fallback order.
       std::expected<void, std::error_code> configure_system_ca_certificates(
          std::optional<std::string_view> cert_bundle_file = std::nullopt)
@@ -1097,8 +1443,7 @@ namespace glz
       void clear_connection_pool() { connection_pool->clear(); }
 
       // Synchronous GET request - truly synchronous, no promises/futures
-      std::expected<response, std::error_code> get(std::string_view url,
-                                                   const std::unordered_map<std::string, std::string>& headers = {})
+      std::expected<response, std::error_code> get(std::string_view url, const glz::http_headers& headers = {})
       {
          auto url_result = parse_url(url);
          if (!url_result) {
@@ -1110,7 +1455,7 @@ namespace glz
 
       // Synchronous POST request - truly synchronous, no promises/futures
       std::expected<response, std::error_code> post(std::string_view url, const std::string& body,
-                                                    const std::unordered_map<std::string, std::string>& headers = {})
+                                                    const glz::http_headers& headers = {})
       {
          auto url_result = parse_url(url);
          if (!url_result) {
@@ -1122,7 +1467,7 @@ namespace glz
 
       // Synchronous PUT request - truly synchronous, no promises/futures
       std::expected<response, std::error_code> put(std::string_view url, const std::string& body,
-                                                   const std::unordered_map<std::string, std::string>& headers = {})
+                                                   const glz::http_headers& headers = {})
       {
          auto url_result = parse_url(url);
          if (!url_result) {
@@ -1132,10 +1477,22 @@ namespace glz
          return perform_sync_request("PUT", *url_result, body, headers);
       }
 
+      // Synchronous PATCH request - truly synchronous, no promises/futures
+      std::expected<response, std::error_code> patch(std::string_view url, const std::string& body,
+                                                     const glz::http_headers& headers = {})
+      {
+         auto url_result = parse_url(url);
+         if (!url_result) {
+            return std::unexpected(url_result.error());
+         }
+
+         return perform_sync_request("PATCH", *url_result, body, headers);
+      }
+
       // Synchronous JSON POST request
       template <class T>
-      std::expected<response, std::error_code> post_json(
-         std::string_view url, const T& data, const std::unordered_map<std::string, std::string>& headers = {})
+      std::expected<response, std::error_code> post_json(std::string_view url, const T& data,
+                                                         const glz::http_headers& headers = {})
       {
          std::string json_str;
          auto ec = glz::write_json(data, json_str);
@@ -1143,16 +1500,13 @@ namespace glz
             return std::unexpected(std::make_error_code(std::errc::invalid_argument));
          }
 
-         auto merged_headers = headers;
-         merged_headers["content-type"] = "application/json";
-
-         return post(url, json_str, merged_headers);
+         return post(url, json_str, detail::with_json_content_type(headers));
       }
 
       // Synchronous JSON PUT request
       template <class T>
-      std::expected<response, std::error_code> put_json(
-         std::string_view url, const T& data, const std::unordered_map<std::string, std::string>& headers = {})
+      std::expected<response, std::error_code> put_json(std::string_view url, const T& data,
+                                                        const glz::http_headers& headers = {})
       {
          std::string json_str;
          auto ec = glz::write_json(data, json_str);
@@ -1160,10 +1514,21 @@ namespace glz
             return std::unexpected(std::make_error_code(std::errc::invalid_argument));
          }
 
-         auto merged_headers = headers;
-         merged_headers["content-type"] = "application/json";
+         return put(url, json_str, detail::with_json_content_type(headers));
+      }
 
-         return put(url, json_str, merged_headers);
+      // Synchronous JSON PATCH request
+      template <class T>
+      std::expected<response, std::error_code> patch_json(std::string_view url, const T& data,
+                                                          const glz::http_headers& headers = {})
+      {
+         std::string json_str;
+         auto ec = glz::write_json(data, json_str);
+         if (ec) {
+            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+         }
+
+         return patch(url, json_str, detail::with_json_content_type(headers));
       }
 
       [[deprecated("use stream_request_v2 instead")]]
@@ -1171,32 +1536,35 @@ namespace glz
       {
          auto url_result = parse_url(params.url);
          if (!url_result) {
-            asio::post(io_executor, [on_error = params.on_error, error = url_result.error()]() { on_error(error); });
+            asio::post(io_executor, [on_error = params.on_error, error = url_result.error()]() {
+               if (on_error) on_error(error);
+            });
             return nullptr;
          }
 
          return perform_stream_request(params.method, *url_result, params.body, params.max_buffer_size, params.headers,
                                        params.timeout, params.strategy, params.status_is_error, params.on_data,
-                                       params.on_error, params.on_connect, params.on_disconnect);
+                                       params.on_error, params.on_connect, params.on_disconnect, {});
       }
 
       std::shared_ptr<http_stream_connection> stream_request_v2(const stream_request_params_v2& params)
       {
          auto url_result = parse_url(params.url);
          if (!url_result) {
-            asio::post(io_executor, [on_error = params.on_error, error = url_result.error()]() { on_error(error); });
+            asio::post(io_executor, [on_error = params.on_error, error = url_result.error()]() {
+               if (on_error) on_error(error);
+            });
             return nullptr;
          }
 
          return perform_stream_request(params.method, *url_result, params.body, params.max_buffer_size, params.headers,
                                        params.timeout, params.strategy, params.status_is_error, params.on_data,
-                                       params.on_error, params.on_connect, params.on_disconnect);
+                                       params.on_error, params.on_connect, params.on_disconnect, params.on_progress);
       }
 
       // Asynchronous GET request
       template <typename CompletionHandler>
-      void get_async(std::string_view url, const std::unordered_map<std::string, std::string>& headers,
-                     CompletionHandler&& handler)
+      void get_async(std::string_view url, const glz::http_headers& headers, CompletionHandler&& handler)
       {
          auto url_result = parse_url(url);
          if (!url_result) {
@@ -1209,8 +1577,8 @@ namespace glz
       }
 
       // Overload for get_async without completion handler (returns future)
-      std::future<std::expected<response, std::error_code>> get_async(
-         std::string_view url, const std::unordered_map<std::string, std::string>& headers = {})
+      std::future<std::expected<response, std::error_code>> get_async(std::string_view url,
+                                                                      const glz::http_headers& headers = {})
       {
          std::promise<std::expected<response, std::error_code>> promise;
          auto future = promise.get_future();
@@ -1225,8 +1593,8 @@ namespace glz
 
       // Asynchronous POST request
       template <typename CompletionHandler>
-      void post_async(std::string_view url, const std::string& body,
-                      const std::unordered_map<std::string, std::string>& headers, CompletionHandler&& handler)
+      void post_async(std::string_view url, const std::string& body, const glz::http_headers& headers,
+                      CompletionHandler&& handler)
       {
          auto url_result = parse_url(url);
          if (!url_result) {
@@ -1239,9 +1607,8 @@ namespace glz
       }
 
       // Overload for post_async without completion handler (returns future)
-      std::future<std::expected<response, std::error_code>> post_async(
-         std::string_view url, const std::string& body,
-         const std::unordered_map<std::string, std::string>& headers = {})
+      std::future<std::expected<response, std::error_code>> post_async(std::string_view url, const std::string& body,
+                                                                       const glz::http_headers& headers = {})
       {
          std::promise<std::expected<response, std::error_code>> promise;
          auto future = promise.get_future();
@@ -1256,8 +1623,8 @@ namespace glz
 
       // Async JSON POST request
       template <class T, typename CompletionHandler>
-      void post_json_async(std::string_view url, const T& data,
-                           const std::unordered_map<std::string, std::string>& headers, CompletionHandler&& handler)
+      void post_json_async(std::string_view url, const T& data, const glz::http_headers& headers,
+                           CompletionHandler&& handler)
       {
          std::string json_str;
          auto ec = glz::write_json(data, json_str);
@@ -1268,16 +1635,13 @@ namespace glz
             return;
          }
 
-         auto merged_headers = headers;
-         merged_headers["content-type"] = "application/json";
-
-         post_async(url, json_str, merged_headers, std::forward<CompletionHandler>(handler));
+         post_async(url, json_str, detail::with_json_content_type(headers), std::forward<CompletionHandler>(handler));
       }
 
       // Overload for post_json_async without completion handler (returns future)
       template <class T>
-      std::future<std::expected<response, std::error_code>> post_json_async(
-         std::string_view url, const T& data, const std::unordered_map<std::string, std::string>& headers = {})
+      std::future<std::expected<response, std::error_code>> post_json_async(std::string_view url, const T& data,
+                                                                            const glz::http_headers& headers = {})
       {
          std::promise<std::expected<response, std::error_code>> promise;
          auto future = promise.get_future();
@@ -1304,8 +1668,33 @@ namespace glz
 
       size_t max_response_body_size() const { return max_response_body_size_; }
 
+      // Maximum number of 3xx hops to follow automatically (0 = do not follow, the
+      // default: the 3xx response is returned to the caller as-is).
+      //
+      // A followed hop takes the target of the response's Location field, resolved against
+      // the URL that produced it. 303 continues as GET, as does a POST answered with 301 or
+      // 302; 307 and 308 keep the method and body. Credentials (Authorization,
+      // Proxy-Authorization, Cookie) and a caller-supplied Host are dropped when a hop
+      // crosses to a different scheme, host or port. Exceeding the limit returns
+      // http_client_error::too_many_redirects; a missing or unusable Location returns
+      // http_client_error::invalid_redirect.
+      //
+      // Applies to the sync and async request methods. Streaming requests
+      // (stream_request_v2) always deliver the 3xx response itself.
+      //
+      // Must be configured before issuing requests; not safe to change while requests are
+      // in flight.
+      http_client& max_redirects(size_t max_hops)
+      {
+         max_redirects_ = max_hops;
+         return *this;
+      }
+
+      size_t max_redirects() const { return max_redirects_; }
+
      private:
       size_t max_response_body_size_ = http_default_max_body_size;
+      size_t max_redirects_ = 0;
       // For async operations only when no io_executor is provided
       std::shared_ptr<asio::io_context> async_io_context;
       asio::any_io_executor io_executor;
@@ -1354,16 +1743,17 @@ namespace glz
 
       std::shared_ptr<http_stream_connection> perform_stream_request(
          const std::string& method, const url_parts& url, const std::string& body, size_t max_buffer_size,
-         const std::unordered_map<std::string, std::string>& headers, std::chrono::seconds timeout,
-         stream_read_strategy strategy, std::function<bool(int)> status_is_error, http_data_handler on_data,
-         http_error_handler on_error, http_connect_handler on_connect, http_disconnect_handler on_disconnect)
+         const glz::http_headers& headers, std::chrono::seconds timeout, stream_read_strategy strategy,
+         std::function<bool(int)> status_is_error, http_data_handler on_data, http_error_handler on_error,
+         http_connect_handler on_connect, http_disconnect_handler on_disconnect, http_progress_handler on_progress)
       {
          const bool use_https = (url.protocol == "https");
 
 #ifndef GLZ_ENABLE_SSL
          if (use_https) {
-            asio::post(io_executor,
-                       [on_error = std::move(on_error)]() { on_error(make_error_code(ssl_error::ssl_not_supported)); });
+            asio::post(io_executor, [on_error = std::move(on_error)]() {
+               if (on_error) on_error(make_error_code(ssl_error::ssl_not_supported));
+            });
             return nullptr;
          }
 #endif
@@ -1375,18 +1765,40 @@ namespace glz
          connection->is_https = use_https;
 
          connection->status_is_error = std::move(status_is_error);
+         connection->on_progress = std::move(on_progress);
+         connection->head_request = (method == "HEAD");
 
          // Wrap the disconnect handler to return the socket to the pool
          auto internal_on_disconnect = [this, user_on_disconnect = std::move(on_disconnect), connection, url,
                                         use_https]() {
             connection->is_connected = false;
-            // Call the user's handler if provided
+            // Settle the socket before telling the caller the stream ended, matching the
+            // non-streaming paths, which return the connection and only then run the
+            // completion handler. The other order publishes "finished" while the socket is
+            // still in hand, so a caller that starts its next request from on_disconnect
+            // finds an empty pool and dials a second connection - never reusing the very
+            // socket the code below is about to make reusable.
+            if (connection->socket) {
+               // Only a socket sitting at the end of a fully-read response can serve
+               // the next request. Pooling one that timed out, errored, or was
+               // abandoned part way through the body hands the next request a socket
+               // with the tail of this response still arriving on it, which that
+               // request reads as its own status line - the same desync a conflicting
+               // Content-Length produces, reached through the pool instead. A body
+               // framed by connection close leaves the socket at EOF, which is dead
+               // rather than dangerous, but equally unusable.
+               if (connection->response_complete.load(std::memory_order_relaxed)) {
+                  connection_pool->return_connection(url.host, url.port, use_https, std::move(*connection->socket));
+               }
+               else {
+                  detail::close_socket(*connection->socket, connection_pool->graceful_ssl_shutdown());
+               }
+            }
+            // Returning the socket leaves a null shared_ptr in the variant; every accessor
+            // guards on it, so the disconnect() that http_stream_connection runs from its
+            // destructor is a no-op rather than a dereference of a moved-from socket.
             if (user_on_disconnect) {
                user_on_disconnect();
-            }
-            // Return the connection to the pool for reuse
-            if (connection->socket) {
-               connection_pool->return_connection(url.host, url.port, use_https, std::move(*connection->socket));
             }
          };
 
@@ -1396,7 +1808,7 @@ namespace glz
             if (!ec && !connection->is_connected && !connection->should_stop) {
                // Mark for stop to prevent race conditions
                connection->disconnect();
-               on_error(std::make_error_code(std::errc::timed_out));
+               if (on_error) on_error(std::make_error_code(std::errc::timed_out));
                internal_on_disconnect();
             }
          });
@@ -1421,7 +1833,7 @@ namespace glz
                 internal_on_disconnect = std::move(internal_on_disconnect)](
                   asio::error_code ec, asio::ip::tcp::resolver::results_type results) mutable {
                   if (ec || connection->should_stop) {
-                     on_error(ec);
+                     if (on_error) on_error(ec);
                      internal_on_disconnect(); // Ensure cleanup on resolve error
                      return;
                   }
@@ -1444,7 +1856,7 @@ namespace glz
                             internal_on_disconnect = std::move(internal_on_disconnect)](
                               asio::error_code ec, const asio::ip::tcp::endpoint&) mutable {
                               if (ec || connection->should_stop) {
-                                 on_error(ec);
+                                 if (on_error) on_error(ec);
                                  internal_on_disconnect(); // Ensure cleanup on connect error
                                  return;
                               }
@@ -1477,7 +1889,7 @@ namespace glz
 
 #ifdef GLZ_ENABLE_SSL
       void perform_stream_ssl_handshake(const url_parts& url, const std::string& method, const std::string& body,
-                                        const std::unordered_map<std::string, std::string>& headers,
+                                        const glz::http_headers& headers,
                                         std::shared_ptr<http_stream_connection> connection, http_data_handler on_data,
                                         http_error_handler on_error, http_connect_handler on_connect,
                                         http_disconnect_handler on_disconnect)
@@ -1486,7 +1898,7 @@ namespace glz
 
          // Set SNI hostname for virtual hosting support
          if (!detail::configure_ssl_client_hostname(*ssl_sock, url.host)) {
-            on_error(make_error_code(ssl_error::sni_hostname_failed));
+            if (on_error) on_error(make_error_code(ssl_error::sni_hostname_failed));
             on_disconnect();
             return;
          }
@@ -1496,7 +1908,7 @@ namespace glz
                                              on_error = std::move(on_error), on_connect = std::move(on_connect),
                                              on_disconnect = std::move(on_disconnect)](asio::error_code ec) mutable {
                if (ec || connection->should_stop) {
-                  on_error(ec);
+                  if (on_error) on_error(ec);
                   on_disconnect();
                   return;
                }
@@ -1509,9 +1921,8 @@ namespace glz
 
       // Needs to take the wrapped disconnect handler and use keep-alive
       void send_stream_request(const url_parts& url, const std::string& method, const std::string& body,
-                               const std::unordered_map<std::string, std::string>& headers,
-                               std::shared_ptr<http_stream_connection> connection, http_data_handler on_data,
-                               http_error_handler on_error, http_connect_handler on_connect,
+                               const glz::http_headers& headers, std::shared_ptr<http_stream_connection> connection,
+                               http_data_handler on_data, http_error_handler on_error, http_connect_handler on_connect,
                                http_disconnect_handler on_disconnect)
       {
          const bool use_https = url.protocol == "https";
@@ -1526,7 +1937,7 @@ namespace glz
                                   on_error = std::move(on_error), on_connect = std::move(on_connect),
                                   on_disconnect = std::move(on_disconnect)](asio::error_code ec, std::size_t) mutable {
                                     if (ec || connection->should_stop) {
-                                       on_error(ec);
+                                       if (on_error) on_error(ec);
                                        if (on_disconnect) on_disconnect();
                                        return;
                                     }
@@ -1536,6 +1947,76 @@ namespace glz
                                  });
             },
             *connection->socket);
+      }
+
+      // Returns false once the caller has cancelled from on_progress, which stops the
+      // stream exactly the way disconnect() does and leaves the read loop to unwind
+      // through its usual stopped path.
+      static bool report_stream_progress(const std::shared_ptr<http_stream_connection>& connection)
+      {
+         if (!connection->on_progress) {
+            return true;
+         }
+         const bool keep_going =
+            connection->on_progress(connection->bytes_received, connection->content_length.value_or(0));
+         if (!keep_going) {
+            connection->disconnect();
+         }
+         return keep_going;
+      }
+
+      static bool deliver_stream_body(const std::shared_ptr<http_stream_connection>& connection, std::string_view data,
+                                      const http_data_handler& on_data)
+      {
+         on_data(data);
+         connection->bytes_received += data.size();
+         return report_stream_progress(connection);
+      }
+
+      // How much of `available` still belongs to this response's body. Bytes past the end
+      // of a length-framed body belong to whatever the peer sends next, so they are never
+      // delivered as body no matter that they are already in hand.
+      static size_t stream_body_span(const std::shared_ptr<http_stream_connection>& connection, size_t available)
+      {
+         if (!connection->content_length) {
+            return available;
+         }
+         return (std::min)(available, *connection->content_length - connection->bytes_received);
+      }
+
+      static bool stream_body_complete(const std::shared_ptr<http_stream_connection>& connection)
+      {
+         return connection->content_length && connection->bytes_received >= *connection->content_length;
+      }
+
+      // EOF is simply how a body framed by connection close ends, so it is not reported as
+      // a failure there. A body the response framed with a Content-Length is a different
+      // matter: a close before its last declared byte is an incomplete message
+      // (RFC 9112 8), and handing the caller a short body as though it were whole is how a
+      // truncated download passes for a complete one. The buffered paths already reject
+      // such a response; the streaming path has to say so too.
+      static bool stream_read_failure_is_error(const std::shared_ptr<http_stream_connection>& connection,
+                                               asio::error_code ec)
+      {
+         if (connection->should_stop || ec == asio::error::operation_aborted) {
+            return false;
+         }
+         if (ec != asio::error::eof) {
+            return true;
+         }
+         return !stream_body_complete(connection) && connection->content_length.has_value();
+      }
+
+      // A response read to its framed end leaves the socket positioned at the start of
+      // whatever the server sends next, which is the one state that makes it reusable.
+      // Anything still buffered past that point means the peer sent more than it framed,
+      // so the socket is out of step with its own framing; and a response that asked for
+      // a close is single-use however cleanly it ended.
+      static void mark_stream_reusable(const std::shared_ptr<http_stream_connection>& connection)
+      {
+         if (!connection->peer_will_close.load(std::memory_order_relaxed) && connection->buffer->size() == 0) {
+            connection->response_complete.store(true, std::memory_order_relaxed);
+         }
       }
 
       void read_stream_response(std::shared_ptr<http_stream_connection> connection, http_data_handler on_data,
@@ -1551,7 +2032,7 @@ namespace glz
                    on_connect = std::move(on_connect), on_disconnect = std::move(on_disconnect)](
                      asio::error_code ec, std::size_t bytes_transferred) mutable {
                      if (ec || connection->should_stop) {
-                        on_error(ec);
+                        if (on_error) on_error(ec);
                         if (on_disconnect) on_disconnect();
                         return;
                      }
@@ -1563,7 +2044,7 @@ namespace glz
                      // Parse status line
                      auto line_end = header_data.find("\r\n");
                      if (line_end == std::string_view::npos) {
-                        on_error(std::make_error_code(std::errc::protocol_error));
+                        if (on_error) on_error(std::make_error_code(std::errc::protocol_error));
                         if (on_disconnect) on_disconnect();
                         return;
                      }
@@ -1572,7 +2053,7 @@ namespace glz
 
                      auto parsed_status = parse_http_status_line(status_line);
                      if (!parsed_status) {
-                        on_error(parsed_status.error());
+                        if (on_error) on_error(parsed_status.error());
                         if (on_disconnect) on_disconnect();
                         return;
                      }
@@ -1584,7 +2065,7 @@ namespace glz
                      while (!header_data.starts_with("\r\n")) {
                         line_end = header_data.find("\r\n");
                         if (line_end == std::string_view::npos) {
-                           on_error(std::make_error_code(std::errc::protocol_error));
+                           if (on_error) on_error(std::make_error_code(std::errc::protocol_error));
                            if (on_disconnect) on_disconnect();
                            return;
                         }
@@ -1595,13 +2076,11 @@ namespace glz
                         auto colon_pos = header_line.find(':');
                         if (colon_pos != std::string::npos) {
                            std::string_view name = header_line.substr(0, colon_pos);
-                           // Skip past ':' and any whitespace
-                           size_t value_start = header_line.find_first_not_of(" \t", colon_pos + 1);
-                           std::string_view value =
-                              (value_start != std::string::npos) ? header_line.substr(value_start) : "";
+                           // RFC 9110 5.5 / RFC 9112 5: strip both leading and trailing OWS,
+                           // so a value reaches the caller as the field value proper.
+                           std::string_view value = detail::trim_optional_whitespace(header_line.substr(colon_pos + 1));
 
-                           // Convert header name to lowercase for case-insensitive lookups (RFC 7230)
-                           response_headers.response_headers[to_lower_case(name)] = std::string(value);
+                           response_headers.response_headers.add(std::string(name), std::string(value));
                         }
                      }
 
@@ -1610,6 +2089,16 @@ namespace glz
 
                      connection->is_connected = true;
                      connection->timer->cancel();
+
+                     // RFC 9112 9.3: before HTTP/1.1 the connection closed after each
+                     // response unless the reply opted back in, so the absence of a signal
+                     // means opposite things either side of that line.
+                     const bool keep_alive_is_default = parsed_status->version != "1.0";
+                     connection->peer_will_close.store(
+                        keep_alive_is_default
+                           ? response_headers.response_headers.contains_token("connection", "close")
+                           : !response_headers.response_headers.contains_token("connection", "keep-alive"),
+                        std::memory_order_relaxed);
 
                      if (on_connect) {
                         on_connect(response_headers);
@@ -1621,24 +2110,52 @@ namespace glz
 
                      if (status_is_error) {
                         // Propagate the precise HTTP status via a dedicated error category.
-                        on_error(make_http_status_error(parsed_status->status_code));
+                        if (on_error) on_error(make_http_status_error(parsed_status->status_code));
                         if (on_disconnect) on_disconnect();
                         return;
                      }
 
-                     bool is_chunked = false;
-                     auto it = response_headers.response_headers.find("transfer-encoding");
-                     if (it != response_headers.response_headers.end()) {
-                        if (it->second.find("chunked") != std::string::npos) {
-                           is_chunked = true;
-                        }
+                     // Resolve the body framing before a byte of it is read. read_content_length
+                     // reports `absent` for a chunked response, so the two framings are never
+                     // weighed against each other here either.
+                     const auto content_length_field = detail::read_content_length(response_headers.response_headers);
+                     if (content_length_field.state == detail::content_length_state::unframed) [[unlikely]] {
+                        // RFC 9112 6.3: Content-Length fields that disagree frame no body at all.
+                        // Reading one of the two lengths would leave the remainder on the socket
+                        // for the next reader to take for a status line, so the response is
+                        // refused rather than framed by a guess.
+                        if (on_error) on_error(make_error_code(http_client_error::unframed_response));
+                        if (on_disconnect) on_disconnect();
+                        return;
                      }
 
-                     if (is_chunked) {
+                     // RFC 9110 6.4.1: these replies never carry a body, whatever they frame.
+                     // A Content-Length on a HEAD reply or a 304 states the length the
+                     // equivalent GET would have had, so framing the body by it would wait for
+                     // bytes that are never coming and then report the wait as a truncation.
+                     const int status_code = parsed_status->status_code;
+                     const bool carries_no_body =
+                        connection->head_request || status_code / 100 == 1 || status_code == 204 || status_code == 304;
+
+                     connection->content_length = carries_no_body ? std::optional<size_t>{0}
+                                                  : content_length_field.state == detail::content_length_state::present
+                                                     ? std::optional<size_t>{content_length_field.value}
+                                                     : std::nullopt;
+
+                     // Report the total before any body arrives, so a caller can refuse the
+                     // transfer before it costs anything.
+                     if (!report_stream_progress(connection)) {
+                        if (on_disconnect) on_disconnect();
+                        return;
+                     }
+
+                     if (!carries_no_body &&
+                         response_headers.response_headers.contains_token("transfer-encoding", "chunked")) {
                         start_chunked_reading(connection, std::move(on_data), std::move(on_error),
                                               std::move(on_disconnect));
                      }
                      else {
+                        // A body framed as empty finishes on the first pass through the loop.
                         start_stream_reading(connection, std::move(on_data), std::move(on_error),
                                              std::move(on_disconnect));
                      }
@@ -1667,7 +2184,7 @@ namespace glz
                                                              std::size_t bytes_transferred) mutable {
                      if (ec || connection->should_stop) {
                         if (ec != asio::error::eof && ec != asio::error::operation_aborted && !connection->should_stop)
-                           on_error(ec);
+                           if (on_error) on_error(ec);
                         if (on_disconnect) on_disconnect();
                         return;
                      }
@@ -1686,7 +2203,7 @@ namespace glz
                         std::from_chars(line_view.data(), line_view.data() + line_view.size(), chunk_size, 16);
 
                      if (parse_ec != std::errc{}) {
-                        on_error(std::make_error_code(std::errc::protocol_error));
+                        if (on_error) on_error(std::make_error_code(std::errc::protocol_error));
                         if (on_disconnect) on_disconnect();
                         return;
                      }
@@ -1695,14 +2212,49 @@ namespace glz
                      connection->buffer->consume(bytes_transferred);
 
                      if (chunk_size == 0) {
-                        // Last chunk
-                        if (on_disconnect) on_disconnect();
+                        // Terminal chunk. The trailer section and the final CRLF still sit in
+                        // front of the next response, so the socket is only reusable once they
+                        // have been consumed too (RFC 9112 7.1).
+                        consume_trailers(connection, std::move(on_disconnect));
                         return;
                      }
 
                      read_chunk_body(connection, chunk_size, std::move(on_data), std::move(on_error),
                                      std::move(on_disconnect));
                   });
+            },
+            *connection->socket);
+      }
+
+      // After the terminal chunk, skip the optional trailer section and the final CRLF
+      // (RFC 9112 7.1.2). Only then does the socket sit at the start of whatever the
+      // server sends next, which is the one state that makes it reusable.
+      void consume_trailers(std::shared_ptr<http_stream_connection> connection, http_disconnect_handler on_disconnect)
+      {
+         std::visit(
+            [&, this](auto& sock) {
+               asio::async_read_until(*sock, *connection->buffer, "\r\n",
+                                      [this, connection, on_disconnect = std::move(on_disconnect)](
+                                         asio::error_code ec, std::size_t bytes_transferred) mutable {
+                                         // The body is already delivered in full, so a failure here is not reported
+                                         // to the caller - it only means the socket cannot be reused.
+                                         if (ec || connection->should_stop) {
+                                            if (on_disconnect) on_disconnect();
+                                            return;
+                                         }
+
+                                         const bool end_of_trailers = (bytes_transferred == 2); // just "\r\n"
+                                         connection->buffer->consume(bytes_transferred);
+
+                                         if (!end_of_trailers) {
+                                            consume_trailers(connection,
+                                                             std::move(on_disconnect)); // trailer field line
+                                            return;
+                                         }
+
+                                         mark_stream_reusable(connection);
+                                         if (on_disconnect) on_disconnect();
+                                      });
             },
             *connection->socket);
       }
@@ -1715,7 +2267,7 @@ namespace glz
          // buffered-size check with a tiny length, and hands on_data a view of chunk_size bytes
          // over a few-byte buffer. Reject it as a malformed chunk.
          if (chunk_size > (std::numeric_limits<size_t>::max)() - 2) [[unlikely]] {
-            on_error(std::make_error_code(std::errc::protocol_error));
+            if (on_error) on_error(std::make_error_code(std::errc::protocol_error));
             if (on_disconnect) on_disconnect();
             return;
          }
@@ -1726,8 +2278,12 @@ namespace glz
          // Check if we have enough data in the buffer already.
          if (connection->buffer->size() >= total_to_read) {
             std::string_view data{static_cast<const char*>(connection->buffer->data().data()), chunk_size};
-            on_data(data);
+            const bool keep_going = deliver_stream_body(connection, data, on_data);
             connection->buffer->consume(total_to_read);
+            if (!keep_going) {
+               if (on_disconnect) on_disconnect();
+               return;
+            }
 
             // Post the next read to avoid deep recursion
             std::visit(
@@ -1751,14 +2307,18 @@ namespace glz
                    on_disconnect = std::move(on_disconnect)](asio::error_code ec, std::size_t) mutable {
                      if (ec || connection->should_stop) {
                         if (ec != asio::error::eof && ec != asio::error::operation_aborted && !connection->should_stop)
-                           on_error(ec);
+                           if (on_error) on_error(ec);
                         if (on_disconnect) on_disconnect();
                         return;
                      }
 
                      std::string_view data{static_cast<const char*>(connection->buffer->data().data()), chunk_size};
-                     on_data(data);
+                     const bool keep_going = deliver_stream_body(connection, data, on_data);
                      connection->buffer->consume(chunk_size + 2); // Consume data + trailing CRLF
+                     if (!keep_going) {
+                        if (on_disconnect) on_disconnect();
+                        return;
+                     }
 
                      read_chunk_size(connection, std::move(on_data), std::move(on_error), std::move(on_disconnect));
                   });
@@ -1766,30 +2326,20 @@ namespace glz
             *connection->socket);
       }
 
+      // The one body read loop: whatever is already buffered goes out, then the framing
+      // decides whether the stream is over or another read is due. The strategy decides
+      // only how much a single read may take, never where the body ends.
       void start_stream_reading(std::shared_ptr<http_stream_connection> connection, http_data_handler on_data,
                                 http_error_handler on_error, http_disconnect_handler on_disconnect)
       {
-         // Dispatch to the appropriate strategy
-         switch (connection->strategy) {
-         case stream_read_strategy::bulk_transfer:
-            start_stream_reading_bulk(connection, std::move(on_data), std::move(on_error), std::move(on_disconnect));
-            break;
-         case stream_read_strategy::immediate_delivery:
-            start_stream_reading_immediate(connection, std::move(on_data), std::move(on_error),
-                                           std::move(on_disconnect));
-            break;
-         }
-      }
-
-      void start_stream_reading_bulk(std::shared_ptr<http_stream_connection> connection, http_data_handler on_data,
-                                     http_error_handler on_error, http_disconnect_handler on_disconnect)
-      {
-         // Process any existing data in buffer first
-         if (connection->buffer->size() > 0) {
-            std::string_view data{static_cast<const char*>(connection->buffer->data().data()),
-                                  connection->buffer->size()};
-            on_data(data);
-            connection->buffer->consume(connection->buffer->size());
+         if (const size_t span = stream_body_span(connection, connection->buffer->size()); span > 0) {
+            std::string_view data{static_cast<const char*>(connection->buffer->data().data()), span};
+            const bool keep_going = deliver_stream_body(connection, data, on_data);
+            connection->buffer->consume(span);
+            if (!keep_going) {
+               if (on_disconnect) on_disconnect();
+               return;
+            }
          }
 
          if (connection->should_stop) {
@@ -1797,77 +2347,82 @@ namespace glz
             return;
          }
 
-         // Use async_read with transfer_at_least(1) - may read more data for efficiency
-         std::visit(
-            [&, this](auto& sock) {
-               asio::async_read(*sock, *connection->buffer, asio::transfer_at_least(1),
-                                [this, connection, on_data, on_error, on_disconnect](
-                                   asio::error_code ec, std::size_t /*bytes_transferred*/) {
-                                   if (ec || connection->should_stop) {
-                                      if (ec != asio::error::eof && ec != asio::error::operation_aborted &&
-                                          !connection->should_stop) {
-                                         on_error(ec);
-                                      }
-                                      if (on_disconnect) on_disconnect();
-                                      return;
-                                   }
-
-                                   // Recurse to process the new data
-                                   start_stream_reading_bulk(connection, on_data, on_error, on_disconnect);
-                                });
-            },
-            *connection->socket);
-      }
-
-      void start_stream_reading_immediate(std::shared_ptr<http_stream_connection> connection, http_data_handler on_data,
-                                          http_error_handler on_error, http_disconnect_handler on_disconnect)
-      {
-         // Process existing buffer content first
-         if (connection->buffer->size() > 0) {
-            std::string_view data{static_cast<const char*>(connection->buffer->data().data()),
-                                  connection->buffer->size()};
-            on_data(data);
-            connection->buffer->consume(connection->buffer->size());
-         }
-
-         if (connection->should_stop) {
+         // A length-framed body ends at its last byte, not at the peer's close: waiting on
+         // a read that the framing says will never carry body would stall the stream until
+         // the connection dropped, and would forfeit a socket that is ready to be reused.
+         if (stream_body_complete(connection)) {
+            mark_stream_reusable(connection);
             if (on_disconnect) on_disconnect();
             return;
          }
 
-         // Use async_read_some for immediate delivery of available data
-         constexpr size_t read_size = 8192;
+         auto resume = [this, connection, on_data, on_error, on_disconnect](asio::error_code ec,
+                                                                            std::size_t bytes_transferred) {
+            if (ec || connection->should_stop) {
+               if (stream_read_failure_is_error(connection, ec)) {
+                  if (on_error) on_error(ec);
+               }
+               if (on_disconnect) on_disconnect();
+               return;
+            }
+
+            if (connection->strategy == stream_read_strategy::immediate_delivery) {
+               connection->buffer->commit(bytes_transferred); // async_read commits for itself
+            }
+            start_stream_reading(connection, on_data, on_error, on_disconnect);
+         };
+
          std::visit(
-            [&, this](auto& sock) {
-               sock->async_read_some(connection->buffer->prepare(read_size), [this, connection, on_data, on_error,
-                                                                              on_disconnect](
-                                                                                asio::error_code ec,
-                                                                                std::size_t bytes_transferred) {
-                  if (ec || connection->should_stop) {
-                     if (ec != asio::error::eof && ec != asio::error::operation_aborted && !connection->should_stop) {
-                        on_error(ec);
-                     }
-                     if (on_disconnect) on_disconnect();
-                     return;
-                  }
-
-                  // Commit the received data and deliver immediately
-                  connection->buffer->commit(bytes_transferred);
-
-                  std::string_view data{static_cast<const char*>(connection->buffer->data().data()), bytes_transferred};
-                  on_data(data);
-                  connection->buffer->consume(bytes_transferred);
-
-                  // Continue reading
-                  start_stream_reading_immediate(connection, on_data, on_error, on_disconnect);
-               });
+            [&](auto& sock) {
+               if (connection->strategy == stream_read_strategy::bulk_transfer) {
+                  // transfer_at_least(1) is free to take more in one go, for throughput.
+                  asio::async_read(*sock, *connection->buffer, asio::transfer_at_least(1), std::move(resume));
+               }
+               else {
+                  // Immediate delivery hands over whatever has arrived, so it reads into a
+                  // bounded window: no more than the body has left, so a read cannot run past
+                  // the body and strand the next response's bytes in this buffer, and no more
+                  // than the buffer can hold, which a small max_buffer_size would otherwise
+                  // overrun.
+                  constexpr size_t max_read_size = 8192;
+                  const size_t window = (std::min)(stream_body_span(connection, max_read_size),
+                                                   connection->buffer->max_size() - connection->buffer->size());
+                  sock->async_read_some(connection->buffer->prepare(window), std::move(resume));
+               }
             },
             *connection->socket);
       }
 
-      std::expected<response, std::error_code> perform_sync_request(
-         const std::string& method, const url_parts& url, const std::string& body,
-         const std::unordered_map<std::string, std::string>& headers)
+      // Drives one request to its final response, following 3xx hops while the client is
+      // configured to. The common case - no redirect, or following switched off - costs
+      // one status-code test on top of the single exchange below.
+      std::expected<response, std::error_code> perform_sync_request(const std::string& method, const url_parts& url,
+                                                                    const std::string& body,
+                                                                    const glz::http_headers& headers)
+      {
+         auto result = perform_sync_exchange(method, url, body, headers);
+         if (max_redirects_ == 0 || !result || !is_redirect_status(result->status_code)) {
+            return result;
+         }
+
+         // A hop is being taken, so the request now has to be carried and rewritten;
+         // copying it here keeps that cost off the straight-through path.
+         detail::redirect_request request{method, url, body, headers, 0};
+         do {
+            if (auto applied = detail::apply_redirect(*result, request, max_redirects_); !applied) {
+               return std::unexpected(applied.error());
+            }
+            result = perform_sync_exchange(request.method, request.url, request.body, request.headers);
+         } while (result && is_redirect_status(result->status_code));
+
+         return result;
+      }
+
+      // A single request/response exchange, including the one transparent retry a stale
+      // pooled connection warrants.
+      std::expected<response, std::error_code> perform_sync_exchange(const std::string& method, const url_parts& url,
+                                                                     const std::string& body,
+                                                                     const glz::http_headers& headers)
       {
          const bool use_https = (url.protocol == "https");
 
@@ -1987,11 +2542,7 @@ namespace glz
             }
 
             // Parse headers from the view
-            std::unordered_map<std::string, std::string> response_headers;
-            size_t content_length = 0;
-            bool has_content_length = false;
-            bool connection_close = false;
-            bool is_chunked = false;
+            glz::http_headers response_headers;
 
             while (!header_data.starts_with("\r\n")) {
                line_end = header_data.find("\r\n");
@@ -2005,28 +2556,29 @@ namespace glz
                auto colon_pos = header_line.find(':');
                if (colon_pos != std::string::npos) {
                   std::string_view name = header_line.substr(0, colon_pos);
-                  size_t value_start = header_line.find_first_not_of(" \t", colon_pos + 1);
-                  std::string_view value = (value_start != std::string::npos) ? header_line.substr(value_start) : "";
+                  // RFC 9110 5.5 / RFC 9112 5: a field value excludes both leading and
+                  // trailing OWS, and a recipient MUST strip them before evaluating it.
+                  // "Content-Length: 3 " is legal, so keeping the trailing space would
+                  // leave a value no strict parse of the field can accept.
+                  std::string_view value = detail::trim_optional_whitespace(header_line.substr(colon_pos + 1));
 
-                  if (name.length() == 14 && glz::strncasecmp(name.data(), "Content-Length", 14) == 0) {
-                     std::from_chars(value.data(), value.data() + value.size(), content_length);
-                     has_content_length = true;
-                  }
-                  else if (name.length() == 17 && glz::strncasecmp(name.data(), "Transfer-Encoding", 17) == 0) {
-                     if (value.find("chunked") != std::string_view::npos) {
-                        is_chunked = true;
-                     }
-                  }
-                  else if (name.length() == 10 && glz::strncasecmp(name.data(), "Connection", 10) == 0) {
-                     if (value.find("close") != std::string_view::npos) {
-                        connection_close = true;
-                     }
-                  }
-
-                  // Convert header name to lowercase for case-insensitive lookups (RFC 7230)
-                  response_headers.emplace(to_lower_case(name), value);
+                  response_headers.add(std::string(name), std::string(value));
                }
             }
+
+            const auto content_length_field = detail::read_content_length(response_headers);
+            if (content_length_field.state == detail::content_length_state::unframed) [[unlikely]] {
+               // The body boundary is unknowable, so the socket cannot be handed
+               // back to the pool: whatever is left on it would be read as the
+               // head of an unrelated response.
+               detail::close_socket(socket_var, connection_pool->graceful_ssl_shutdown());
+               r.outcome = std::unexpected(make_error_code(http_client_error::unframed_response));
+               return r;
+            }
+            const size_t content_length = content_length_field.value;
+            const bool has_content_length = content_length_field.state == detail::content_length_state::present;
+            const bool is_chunked = response_headers.contains_token("Transfer-Encoding", "chunked");
+            bool connection_close = response_headers.contains_token("Connection", "close");
 
             // Consume header data, leaving only the over-read body part.
             response_buffer.consume(header_bytes);
@@ -2210,10 +2762,53 @@ namespace glz
          }
       }
 
+      // Async counterpart of perform_sync_request: the user handler is called once, with
+      // the response at the end of the redirect chain.
       template <typename CompletionHandler>
       void perform_request_async(const std::string& method, const url_parts& url, const std::string& body,
-                                 const std::unordered_map<std::string, std::string>& headers,
-                                 CompletionHandler&& handler)
+                                 const glz::http_headers& headers, CompletionHandler&& handler)
+      {
+         if (max_redirects_ == 0) {
+            perform_async_exchange(method, url, body, headers, std::forward<CompletionHandler>(handler));
+            return;
+         }
+
+         using handler_t = std::decay_t<CompletionHandler>;
+         // The request outlives each exchange, since a hop rewrites it and sends it again
+         // from a completion handler running on an io thread.
+         // Braced-then-moved rather than make_shared's parenthesized form: the parenthesized
+         // aggregate initialization of P0960 is newer than some of the compilers glaze
+         // supports.
+         auto request =
+            std::make_shared<detail::redirect_request>(detail::redirect_request{method, url, body, headers, 0});
+         auto user_handler = std::make_shared<handler_t>(std::forward<CompletionHandler>(handler));
+         perform_async_exchange_following_redirects<handler_t>(std::move(request), std::move(user_handler));
+      }
+
+      // Recurses through the same instantiation on every hop, so the chain is one lambda
+      // type deep however many redirects the server sends.
+      template <typename Handler>
+      void perform_async_exchange_following_redirects(std::shared_ptr<detail::redirect_request> request,
+                                                      std::shared_ptr<Handler> user_handler)
+      {
+         perform_async_exchange(
+            request->method, request->url, request->body, request->headers,
+            [this, request, user_handler](std::expected<response, std::error_code> result) mutable {
+               if (!result || !is_redirect_status(result->status_code)) {
+                  (*user_handler)(std::move(result));
+                  return;
+               }
+               if (auto applied = detail::apply_redirect(*result, *request, max_redirects_); !applied) {
+                  (*user_handler)(std::unexpected(applied.error()));
+                  return;
+               }
+               perform_async_exchange_following_redirects<Handler>(std::move(request), std::move(user_handler));
+            });
+      }
+
+      template <typename CompletionHandler>
+      void perform_async_exchange(const std::string& method, const url_parts& url, const std::string& body,
+                                  const glz::http_headers& headers, CompletionHandler&& handler)
       {
          const bool use_https = (url.protocol == "https");
 
@@ -2424,8 +3019,7 @@ namespace glz
       template <typename CompletionHandler>
       void async_consume_trailers(std::shared_ptr<socket_variant> socket_var, std::shared_ptr<asio::streambuf> buffer,
                                   std::shared_ptr<std::string> body, const url_parts& url, bool use_https,
-                                  int status_code, std::unordered_map<std::string, std::string> response_headers,
-                                  CompletionHandler&& handler)
+                                  int status_code, glz::http_headers response_headers, CompletionHandler&& handler)
       {
          std::visit(
             [&, this](auto& sock) {
@@ -2454,9 +3048,7 @@ namespace glz
                         resp.response_headers = std::move(response_headers);
                         resp.response_body = std::move(*body);
 
-                        auto connection_header = resp.response_headers.find("connection");
-                        if (connection_header == resp.response_headers.end() ||
-                            connection_header->second.find("close") == std::string::npos) {
+                        if (!resp.response_headers.contains_token("connection", "close")) {
                            connection_pool->return_connection(url.host, url.port, use_https, std::move(*socket_var));
                         }
 
@@ -2476,8 +3068,7 @@ namespace glz
       template <typename CompletionHandler>
       void async_read_chunked_body(std::shared_ptr<socket_variant> socket_var, std::shared_ptr<asio::streambuf> buffer,
                                    std::shared_ptr<std::string> body, const url_parts& url, bool use_https,
-                                   int status_code, std::unordered_map<std::string, std::string> response_headers,
-                                   CompletionHandler&& handler)
+                                   int status_code, glz::http_headers response_headers, CompletionHandler&& handler)
       {
          // Read until we have the chunk size line
          std::visit(
@@ -2532,8 +3123,7 @@ namespace glz
       template <typename CompletionHandler>
       void async_read_chunk_data(std::shared_ptr<socket_variant> socket_var, std::shared_ptr<asio::streambuf> buffer,
                                  std::shared_ptr<std::string> body, size_t chunk_size, const url_parts& url,
-                                 bool use_https, int status_code,
-                                 std::unordered_map<std::string, std::string> response_headers,
+                                 bool use_https, int status_code, glz::http_headers response_headers,
                                  CompletionHandler&& handler)
       {
          // Check accumulated body size against limit before reading chunk data
@@ -2595,8 +3185,7 @@ namespace glz
       template <typename CompletionHandler>
       void async_read_eof_body(std::shared_ptr<socket_variant> socket_var, std::shared_ptr<asio::streambuf> buffer,
                                const url_parts& url, bool use_https, int status_code,
-                               std::unordered_map<std::string, std::string> response_headers,
-                               CompletionHandler&& handler)
+                               glz::http_headers response_headers, CompletionHandler&& handler)
       {
          std::visit(
             [&, this](auto& sock) {
@@ -2659,11 +3248,7 @@ namespace glz
          }
 
          // Parse all header fields from the view.
-         std::unordered_map<std::string, std::string> response_headers;
-         size_t content_length = 0;
-         bool has_content_length = false;
-         bool connection_close = false;
-         bool is_chunked = false;
+         glz::http_headers response_headers;
          // The header section ends with an empty line ("\r\n"), which means our view will start with it.
          while (!header_section.starts_with("\r\n")) {
             line_end = header_section.find("\r\n");
@@ -2677,32 +3262,29 @@ namespace glz
             auto colon_pos = header_line.find(':');
             if (colon_pos != std::string::npos) {
                std::string_view name = header_line.substr(0, colon_pos);
-               // Skip past ':' and any leading whitespace on the value.
-               size_t value_start = header_line.find_first_not_of(" \t", colon_pos + 1);
-               std::string_view value = (value_start != std::string::npos) ? header_line.substr(value_start) : "";
+               // RFC 9110 5.5 / RFC 9112 5: a field value excludes both leading and
+               // trailing OWS, and a recipient MUST strip them before evaluating it.
+               // "Content-Length: 3 " is legal, so keeping the trailing space would
+               // leave a value no strict parse of the field can accept.
+               std::string_view value = detail::trim_optional_whitespace(header_line.substr(colon_pos + 1));
 
-               // A case-insensitive comparison is more robust for header names.
-               if (name.size() == 14 && (name[0] == 'C' || name[0] == 'c') &&
-                   glz::strncasecmp(name.data(), "Content-Length", 14) == 0) {
-                  std::from_chars(value.data(), value.data() + value.size(), content_length);
-                  has_content_length = true;
-               }
-               else if (name.size() == 17 && (name[0] == 'T' || name[0] == 't') &&
-                        glz::strncasecmp(name.data(), "Transfer-Encoding", 17) == 0) {
-                  if (value.find("chunked") != std::string_view::npos) {
-                     is_chunked = true;
-                  }
-               }
-               else if (name.size() == 10 && (name[0] == 'C' || name[0] == 'c') &&
-                        glz::strncasecmp(name.data(), "Connection", 10) == 0) {
-                  if (value.find("close") != std::string_view::npos) {
-                     connection_close = true;
-                  }
-               }
-               // Convert header name to lowercase for case-insensitive lookups (RFC 7230)
-               response_headers.emplace(to_lower_case(name), value);
+               response_headers.add(std::string(name), std::string(value));
             }
          }
+
+         const auto content_length_field = detail::read_content_length(response_headers);
+         if (content_length_field.state == detail::content_length_state::unframed) [[unlikely]] {
+            // The body boundary is unknowable, so the socket cannot be handed back
+            // to the pool: whatever is left on it would be read as the head of an
+            // unrelated response.
+            detail::close_socket(*socket_var, connection_pool->graceful_ssl_shutdown());
+            handler(std::unexpected(make_error_code(http_client_error::unframed_response)));
+            return;
+         }
+         const size_t content_length = content_length_field.value;
+         const bool has_content_length = content_length_field.state == detail::content_length_state::present;
+         const bool is_chunked = response_headers.contains_token("Transfer-Encoding", "chunked");
+         const bool connection_close = response_headers.contains_token("Connection", "close");
 
          // Consume the entire header block from the streambuf.
          // This efficiently discards the header data we've just parsed, leaving only body data.
@@ -2764,10 +3346,7 @@ namespace glz
                         // Pool the connection unless the server asked to close it. A truncated or
                         // peer-closed connection already returned above, so anything reaching here
                         // is a complete response on a still-open socket.
-                        auto connection_header = resp.response_headers.find("connection");
-                        const bool server_wants_close = connection_header != resp.response_headers.end() &&
-                                                        connection_header->second.find("close") != std::string::npos;
-                        if (server_wants_close) {
+                        if (resp.response_headers.contains_token("connection", "close")) {
                            detail::close_socket(*socket_var, connection_pool->graceful_ssl_shutdown());
                         }
                         else {

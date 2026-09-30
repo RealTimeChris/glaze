@@ -81,7 +81,9 @@ struct glz::meta<glz::error_code>
                                     "buffer_overflow",
                                     "invalid_length",
                                     "invalid_utf8",
-                                    "streaming_unsupported"};
+                                    "invalid_control_character",
+                                    "streaming_unsupported",
+                                    "exceeded_max_expansion"};
    static constexpr std::array value{none, //
                                      version_mismatch, //
                                      invalid_header, //
@@ -161,6 +163,9 @@ struct glz::meta<glz::error_code>
                                      invalid_length, //
                                      // Encoding errors
                                      invalid_utf8, //
+                                     invalid_control_character, //
                                      // Streaming errors
-                                     streaming_unsupported};
+                                     streaming_unsupported, //
+                                     // Expansion errors
+                                     exceeded_max_expansion};
 };

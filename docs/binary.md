@@ -167,8 +167,9 @@ struct beve_header {
 | `glz::extension::variant` (1) | Variant (Version 1 only) | Variant index | 1 + compressed_int size |
 | `glz::extension::complex` (3) | Complex number | 2 (real + imag) | 2 |
 | `glz::extension::complex` (3) | Complex array | Element count | 2 + compressed_int size |
+| `glz::extension::complex` (3) | Aligned complex array | Element count (half the nested component count) | 4 + compressed_int size + 1 (padding length byte) |
 
-For complex types, distinguish single complex vs array by checking if `count == 2` and `header_size == 2` (single) or `header_size > 2` (array).
+For complex types, the sub-type is in the low three bits of the complex header, `data[1] & glz::extension::complex_subtype_mask`: `glz::extension::complex_number` (0), `glz::extension::complex_array` (1), or `glz::extension::complex_aligned_array` (2). Other sub-types are rejected with `error_code::syntax_error`.
 
 **Pre-allocation Example**
 
@@ -338,6 +339,8 @@ glz::write<opts>(data, buffer);
 
 Single-byte types (`int8_t`, `uint8_t`) use the standard typed array format since alignment provides no benefit.
 
+Arrays of `std::complex<T>` are written as aligned complex arrays (complex sub-type 2), whose interleaved `re, im` components form a nested aligned typed array. Complex arrays with single-byte components keep the standard complex array format.
+
 ### Zero-Copy Reading with `std::span<const T>`
 
 Read directly into a `std::span<const T>` to get a zero-copy view into the buffer:
@@ -351,6 +354,17 @@ glz::read<glz::opts{.format = glz::BEVE}>(span, buffer);
 ```
 
 The span specialization requires an aligned typed array in the buffer. Reading a standard (non-aligned) typed array into `std::span<const T>` produces an error, since alignment cannot be guaranteed.
+
+`std::span<const std::complex<T>>` works the same way, reading an aligned complex array in place:
+
+```c++
+std::vector<std::complex<double>> iq = {{1.0, 2.0}, {3.0, 4.0}};
+std::string buffer;
+glz::write<opts>(iq, buffer);
+
+std::span<const std::complex<double>> view;
+glz::read<glz::opts{.format = glz::BEVE}>(view, buffer);
+```
 
 > [!IMPORTANT]
 > The buffer must outlive the span. The span points into the buffer's memory.
@@ -480,6 +494,47 @@ Writing is Version 2 only. Version 2 output is not decodable as a variant by a G
 
 `glaze/binary/beve_to_json.hpp` provides `glz::beve_to_json`, which directly converts a buffer of BEVE data to a buffer of JSON data.
 
+An empty buffer holds no value, which is not a document, and fails with `error_code::unexpected_end` rather than converting to empty output. On success the returned `error_ctx::count` is the number of bytes written, which is how a fixed-size output buffer learns how much of it holds JSON.
+
+A buffer holding several values converts to one JSON document per line. See [Delimiter Format](#delimiter-format).
+
+### String Escaping
+
+A BEVE string can hold any byte, including control characters (0x00–1F). JSON cannot. `\n`, `\t`, `\b`, `\f` and `\r` are escaped normally, but the rest have no short escape, and by default the conversion fails rather than write something that will not parse:
+
+```c++
+// a BEVE string holding a 0x01 byte
+std::string json{};
+auto ec = glz::beve_to_json(beve, json);
+// ec.ec == glz::error_code::invalid_control_character
+```
+
+To keep those bytes, turn on `escape_control_characters`. They are written as `\uXXXX` and the document round-trips:
+
+```c++
+struct escaping : glz::opts {
+   bool escape_control_characters = true;
+};
+
+std::string json{};
+auto ec = glz::beve_to_json<escaping{}>(beve, json);   // {"k":"a\u0001b"}
+```
+
+Which to pick:
+
+- **Your data legitimately contains control bytes.** Use `escape_control_characters`. A `std::string` holding a `\0` round-trips through BEVE, and escaping is the only way JSON can carry it.
+- **The bytes are arbitrary,** as in an Erlang binary. Use `binary_as_base64` instead, so no raw bytes end up in a JSON string at all.
+- **You want to know when they appear.** Keep the default and check for `invalid_control_character`.
+
+One thing to weigh when escaping: `\u0000` is valid JSON that every parser accepts, so a NUL in your data reaches whatever reads the JSON back. Embedded nulls can truncate C strings and split log lines.
+
+The same applies to `glz::cbor_to_json`, `glz::bson_to_json`, and `glz::eetf_to_json`. `glz::jsonb_to_json` always escapes, because a JSONB blob stores a JSON document that may have contained `\uXXXX` to begin with.
+
+**Other notes**
+
+- `raw_string` and `unquoted` are ignored by these converters. Both would produce output that is not JSON.
+- UTF-8 is not checked, except by `glz::jsonb_to_json`. Reading the JSON checks it, and `validate_utf8` is on by default there.
+
 ### Function Pointers
 
 Objects that expose function pointers (both member and non-member) through `glz::meta` are skipped by the BEVE writer by default. This mirrors JSON/TOML behaviour and avoids emitting unusable callable placeholders in binary payloads.
@@ -515,6 +570,59 @@ If you prefer to keep a custom conversion in your metadata, `glz::cast` works as
 template <>
 struct glz::meta<ModuleID> {
    static constexpr auto value = glz::cast<&ModuleID::value, uint64_t>;
+};
+```
+
+### Keys That Are Not Strings or Numbers
+
+BEVE object keys must be strings or numbers, because the object header declares one key type for every key and the keys themselves carry no header. A key type that does not reduce to a string or number (for example a struct with several members) fails to compile with a `static_assert`. The same applies to the first type of a `std::pair` and to ranges of pairs.
+
+To serialize such a container, specialize `glz::to` and `glz::from` for it and choose the wire layout yourself. For example, write the map as an array of key/value structs:
+
+```c++
+struct Coord {
+   int x{};
+   int y{};
+   bool operator==(const Coord&) const = default;
+};
+
+template <>
+struct std::hash<Coord> { /* ... */ };
+
+using CoordMap = std::unordered_map<Coord, std::string>;
+
+struct CoordEntry {
+   Coord key{};
+   std::string value{};
+};
+
+template <>
+struct glz::to<glz::BEVE, CoordMap> {
+   template <auto Opts>
+   static void op(const CoordMap& value, is_context auto&& ctx, auto&& b, auto& ix) {
+      std::vector<CoordEntry> entries{};
+      entries.reserve(value.size());
+      for (const auto& [k, v] : value) {
+         entries.push_back({k, v});
+      }
+      serialize<BEVE>::op<Opts>(entries, ctx, b, ix);
+   }
+};
+
+template <>
+struct glz::from<glz::BEVE, CoordMap> {
+   template <auto Opts>
+   static void op(CoordMap& value, is_context auto&& ctx, auto&& it, auto end) {
+      std::vector<CoordEntry> entries{};
+      parse<BEVE>::op<Opts>(entries, ctx, it, end);
+      if (bool(ctx.error)) {
+         return;
+      }
+      value.clear();
+      for (auto& e : entries) {
+         value.emplace(std::move(e.key), std::move(e.value));
+      }
+   }
 };
 ```
 
@@ -700,6 +808,8 @@ auto ec = glz::read_beve_delimited(messages, buffer);
 ### Delimiter Format
 
 The BEVE delimiter is a single byte: `0x06` (extensions type 6 with subtype 0). When converting delimited BEVE to JSON via `glz::beve_to_json`, each delimiter is converted to a newline character (`\n`), producing NDJSON-compatible output.
+
+Values concatenated without delimiters, which `glz::read_beve_delimited` also accepts, get the same newline between them. Two JSON documents never run together into text that is no longer JSON.
 
 ## Lazy BEVE Parsing
 

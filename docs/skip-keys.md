@@ -1,6 +1,8 @@
 # Skip Keys
 
-The `skip` functionality in Glaze allows you to conditionally skip struct members during JSON serialization and parsing at compile time. This feature operates at compile time and can differentiate between serialize and parse operations.
+The `skip` functionality in Glaze allows you to conditionally skip struct members during serialization and parsing at compile time. This feature operates at compile time and can differentiate between serialize and parse operations.
+
+`skip` applies to every format that writes structs as keyed objects: JSON, YAML, TOML, BEVE, CBOR, MessagePack, BSON, and JSONB. The examples below use JSON. Positional layouts (`structs_as_arrays` in BEVE and MessagePack) have no keys to skip, so they keep every member.
 
 ## Overview
 
@@ -152,6 +154,32 @@ const char* json = R"({"name":"NewData","version":2,"computed_field":"ignored","
 glz::read_json(obj, json);
 // obj.computed_field retains "computed_value", obj.input_only_field becomes "new_input"
 ```
+
+## Skipped Fields Need No Serializer
+
+Because `skip` is a compile-time decision, Glaze never instantiates the reader or writer for a field it excludes. A field can therefore be skipped *because* its type cannot be handled in that direction:
+
+```cpp
+struct info_t {
+    int idx{};
+    std::string_view name{};  // a view into the buffer being parsed
+};
+
+template <>
+struct glz::meta<info_t> {
+    static constexpr bool skip(const std::string_view key, const meta_context&) {
+        return key == "name";
+    }
+};
+
+// Streaming reads reject non-owning views (they would point into a window that gets refilled),
+// but `name` is skipped, so this compiles and parses `idx`:
+glz::basic_istream_buffer in{stream};
+info_t value{};
+auto ec = glz::read_json(value, in);
+```
+
+The same applies to a field whose type has no Glaze serializer at all: skipping it for both operations removes the requirement entirely. Fields skipped on parse are also not treated as missing under `error_on_missing_keys`.
 
 ## Value-Based Skipping with `skip_if`
 
