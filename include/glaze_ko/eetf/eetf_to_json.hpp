@@ -42,7 +42,7 @@ namespace glz_ko
 
       template <auto Opts, typename I>
       GLZKO_ALWAYS_INLINE void term_to_json_number(I&& val, auto&& ctx, auto&& it, auto&& end, auto& out,
-                                                 auto&& ix) noexcept
+                                                   auto&& ix) noexcept
       {
          decode_number(val, ctx, it, end);
          if (bool(ctx.error)) {
@@ -52,7 +52,8 @@ namespace glz_ko
       }
 
       template <auto Opts>
-      GLZKO_ALWAYS_INLINE void term_to_json_big_integer(auto&& ctx, auto&& it, auto&& end, auto& out, auto&& ix) noexcept
+      GLZKO_ALWAYS_INLINE void term_to_json_big_integer(auto&& ctx, auto&& it, auto&& end, auto& out,
+                                                        auto&& ix) noexcept
       {
          auto tit = it;
          ++tit; // skip type

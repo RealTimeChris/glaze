@@ -119,7 +119,8 @@ namespace glz_ko
 
          [[nodiscard]] friend bool operator==(const matching_iterator& left, const matching_iterator& right) noexcept
          {
-            return left.owner_ == right.owner_ && left.index_ == right.index_ && glz_ko::striequal(left.key_, right.key_);
+            return left.owner_ == right.owner_ && left.index_ == right.index_ &&
+                   glz_ko::striequal(left.key_, right.key_);
          }
 
         private:

@@ -2920,7 +2920,8 @@ namespace glz_ko
       concept toml_variant_array_type = glz_ko::readable_array_t<T> && !glz_ko::str_t<T>;
 
       template <class T>
-      concept toml_variant_object_type = (glz_ko::glaze_object_t<T> || glz_ko::reflectable<T> || glz_ko::writable_map_t<T>);
+      concept toml_variant_object_type =
+         (glz_ko::glaze_object_t<T> || glz_ko::reflectable<T> || glz_ko::writable_map_t<T>);
 
       template <class T>
       concept toml_variant_null_type = glz_ko::null_t<T>;

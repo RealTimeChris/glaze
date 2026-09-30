@@ -266,7 +266,7 @@ namespace glz_ko
 
    template <class B>
    GLZKO_ALWAYS_INLINE void dump_newline_indent(const byte_sized auto c, size_t n, B& b,
-                                              size_t& ix) noexcept(not vector_like<B>)
+                                                size_t& ix) noexcept(not vector_like<B>)
    {
       if constexpr (vector_like<B>) {
          if (const auto k = ix + n + write_padding_bytes; k > b.size()) [[unlikely]] {

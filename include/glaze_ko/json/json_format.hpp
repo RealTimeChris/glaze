@@ -87,7 +87,8 @@ namespace glz_ko::detail
    // A view handed here must be non-empty: dump memcpy's through `&b[ix]`, which a full buffer has
    // no way to form. Every call site that is not obviously non-empty says why it is.
    template <bool Checked, class B>
-   GLZKO_ALWAYS_INLINE bool emit_bytes(is_context auto& ctx, B& b, size_t& ix, const auto& x) noexcept(not vector_like<B>)
+   GLZKO_ALWAYS_INLINE bool emit_bytes(is_context auto& ctx, B& b, size_t& ix,
+                                       const auto& x) noexcept(not vector_like<B>)
    {
       using T = std::remove_cvref_t<decltype(x)>;
       if constexpr (byte_sized<T>) {

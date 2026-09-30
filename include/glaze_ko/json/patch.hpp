@@ -100,8 +100,8 @@ struct glz_ko::meta<glz_ko::patch_op_t<GenericType>>
    static constexpr auto read_value = [](T& op, GenericType input) { op.value = std::move(input); };
    static constexpr auto write_value = [](const T& op) -> const std::optional<GenericType>& { return op.value; };
 
-   static constexpr auto value =
-      glz_ko::object("op", &T::op, "path", &T::path, "value", glz_ko::custom<read_value, write_value>, "from", &T::from);
+   static constexpr auto value = glz_ko::object("op", &T::op, "path", &T::path, "value",
+                                                glz_ko::custom<read_value, write_value>, "from", &T::from);
 
    // RFC 6902 section 4: every operation carries "op" and "path". "value" and "from" are required
    // only for particular operations, which apply_operation checks, so they are not required here.

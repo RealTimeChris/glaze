@@ -48,11 +48,11 @@ namespace glz_ko
 
       template <class T>
       struct custom_read_input_type<
-         T,
-         std::enable_if_t<has_custom_meta_v<T> &&
-                          is_invocable_concrete<typename decltype(glz_ko::meta<T>::value(std::declval<T&>()))::from_t> &&
-                          (glz_ko::tuple_size_v<invocable_args_t<typename decltype(glz_ko::meta<T>::value(
-                              std::declval<T&>()))::from_t>> >= 2)>>
+         T, std::enable_if_t<
+               has_custom_meta_v<T> &&
+               is_invocable_concrete<typename decltype(glz_ko::meta<T>::value(std::declval<T&>()))::from_t> &&
+               (glz_ko::tuple_size_v<
+                   invocable_args_t<typename decltype(glz_ko::meta<T>::value(std::declval<T&>()))::from_t>> >= 2)>>
       {
          static constexpr bool has_custom = true;
          using CustomT = decltype(glz_ko::meta<T>::value(std::declval<T&>()));

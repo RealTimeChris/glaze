@@ -57,7 +57,8 @@ namespace glz_ko
          virtual bool caller(const sv path, const glz_ko::hash_t type_hash, void*& ret,
                              std::span<void*> args) noexcept = 0;
 
-         virtual std::unique_ptr<void, void (*)(void*)> get_fn(const sv path, const glz_ko::hash_t type_hash) noexcept = 0;
+         virtual std::unique_ptr<void, void (*)(void*)> get_fn(const sv path,
+                                                               const glz_ko::hash_t type_hash) noexcept = 0;
 
          std::string error{};
       };

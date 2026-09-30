@@ -999,7 +999,8 @@ namespace glz_ko
       {}
 
       // Send initial headers for streaming response
-      void send_headers(int status_code, const glz_ko::http_headers& headers = {}, data_sent_handler handler = {}) override
+      void send_headers(int status_code, const glz_ko::http_headers& headers = {},
+                        data_sent_handler handler = {}) override
       {
          if (is_headers_sent_) return;
          is_headers_sent_ = true;
@@ -1027,8 +1028,8 @@ namespace glz_ko
             if (header_field_has_crlf(name, value)) [[unlikely]] {
                continue;
             }
-            if (framing_forbidden &&
-                (glz_ko::striequal(name, "content-length") || glz_ko::striequal(name, "transfer-encoding"))) [[unlikely]] {
+            if (framing_forbidden && (glz_ko::striequal(name, "content-length") ||
+                                      glz_ko::striequal(name, "transfer-encoding"))) [[unlikely]] {
                continue;
             }
             response_str.append(name);
@@ -1551,7 +1552,8 @@ namespace glz_ko
                                      asio::ssl::context::no_tlsv1_1);
             ssl_context->set_default_verify_paths();
 #else
-            static_assert(!EnableTLS, "TLS support requires GLZKO_ENABLE_SSL to be defined and OpenSSL to be available");
+            static_assert(!EnableTLS,
+                          "TLS support requires GLZKO_ENABLE_SSL to be defined and OpenSSL to be available");
 #endif
          }
       }

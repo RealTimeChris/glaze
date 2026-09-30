@@ -217,7 +217,7 @@ namespace glz_ko
       template <auto Opts>
          requires(check_no_header(Opts))
       GLZKO_ALWAYS_INLINE static void op(auto&& value, const uint8_t tag, is_context auto&& ctx, auto&& it,
-                                       auto end) noexcept
+                                         auto end) noexcept
       {
          if (invalid_end(ctx, it, end)) {
             return;
@@ -522,7 +522,7 @@ namespace glz_ko
       // A sub-type 2 payload has been bounds checked; a sub-type 1 payload is left to the caller.
       template <class X>
       [[nodiscard]] GLZKO_ALWAYS_INLINE size_t read_beve_complex_array_header(is_context auto&& ctx, auto&& it,
-                                                                            auto end) noexcept
+                                                                              auto end) noexcept
       {
          if (invalid_end(ctx, it, end)) {
             return 0;
@@ -574,7 +574,7 @@ namespace glz_ko
    {
       template <auto Opts>
       GLZKO_ALWAYS_INLINE static void op(auto&& /*value*/, is_context auto&& /*ctx*/, auto&& /*it*/,
-                                       auto&& /*end*/) noexcept
+                                         auto&& /*end*/) noexcept
       {}
    };
 
@@ -3504,7 +3504,7 @@ namespace glz_ko
    //   auto result = glz_ko::read_beve_at<glz_ko::opts{}>(value, buffer, offset, ctx);
    template <auto Opts = opts{}, read_supported<BEVE> T, class Buffer>
    [[nodiscard]] glz_ko::expected<size_t, error_ctx> read_beve_at(T& value, Buffer&& buffer, size_t offset,
-                                                               is_context auto&& ctx)
+                                                                  is_context auto&& ctx)
    {
       static_assert(sizeof(decltype(*buffer.data())) == 1);
 

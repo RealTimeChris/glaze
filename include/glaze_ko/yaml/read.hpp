@@ -1694,8 +1694,8 @@ namespace glz_ko
                   if (parse_structured_alias_key) {
                      glz_ko::generic key_node{};
                      auto temp_ctx = ctx.make_speculative();
-                     from<YAML, glz_ko::generic>::template op<opts{.error_on_unknown_keys = false}>(key_node, temp_ctx,
-                                                                                                 replay_it, replay_end);
+                     from<YAML, glz_ko::generic>::template op<opts{.error_on_unknown_keys = false}>(
+                        key_node, temp_ctx, replay_it, replay_end);
                      ctx.alias_expansion_budget = temp_ctx.alias_expansion_budget; // charged even if rejected
                      ctx.key_expansion_budget = temp_ctx.key_expansion_budget;
                      if (bool(temp_ctx.error)) [[unlikely]] {
@@ -2342,7 +2342,8 @@ namespace glz_ko
          }
 
          if constexpr (std::floating_point<std::remove_cvref_t<T>>) {
-            auto result = glz_ko::fast_float::from_chars(parse_view.data(), parse_view.data() + parse_view.size(), value);
+            auto result =
+               glz_ko::fast_float::from_chars(parse_view.data(), parse_view.data() + parse_view.size(), value);
             // Check both for errors and that all input was consumed (e.g., "12:30" is not a valid number)
             if (result.ec != std::errc{} || result.ptr != parse_view.data() + parse_view.size()) {
                ctx.error = error_code::parse_number_failure;
@@ -4294,7 +4295,8 @@ namespace glz_ko
                }
                else {
                   using element_t = std::decay_t<decltype(glz_ko::get<I>(value))>;
-                  from<YAML, element_t>::template op<yaml::flow_context_on<Opts>()>(glz_ko::get<I>(value), ctx, it, end);
+                  from<YAML, element_t>::template op<yaml::flow_context_on<Opts>()>(glz_ko::get<I>(value), ctx, it,
+                                                                                    end);
                }
 
                yaml::skip_ws_and_newlines(it, end);
@@ -4352,8 +4354,8 @@ namespace glz_ko
                            }
                            else if constexpr (glaze_array_t<T>) {
                               using element_t = std::decay_t<decltype(get_member(value, glz_ko::get<I>(meta_v<T>)))>;
-                              from<YAML, element_t>::template op<Opts>(get_member(value, glz_ko::get<I>(meta_v<T>)), ctx,
-                                                                       it, end);
+                              from<YAML, element_t>::template op<Opts>(get_member(value, glz_ko::get<I>(meta_v<T>)),
+                                                                       ctx, it, end);
                            }
                            else {
                               using element_t = std::decay_t<decltype(glz_ko::get<I>(value))>;

@@ -1006,8 +1006,8 @@ namespace glz_ko
                }
 
                if constexpr (glaze_array_t<V>) {
-                  serialize<YAML>::op<yaml::flow_context_on<Opts>()>(get_member(value, glz_ko::get<I>(meta_v<T>)), ctx, b,
-                                                                     ix);
+                  serialize<YAML>::op<yaml::flow_context_on<Opts>()>(get_member(value, glz_ko::get<I>(meta_v<T>)), ctx,
+                                                                     b, ix);
                }
                else if constexpr (is_std_tuple<T>) {
                   using element_t = core_t<decltype(std::get<I>(value))>;

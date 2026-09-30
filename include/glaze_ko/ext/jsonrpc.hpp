@@ -123,9 +123,9 @@ namespace glz_ko::rpc
       {
          using T = request_t;
          static constexpr auto value = glz_ko::object("jsonrpc", &T::version, //
-                                                   &T::method, //
-                                                   &T::params, //
-                                                   &T::id);
+                                                      &T::method, //
+                                                      &T::params, //
+                                                      &T::id);
       };
    };
 
@@ -154,9 +154,9 @@ namespace glz_ko::rpc
       {
          using T = request_envelope_t;
          static constexpr auto value = glz_ko::object("jsonrpc", &T::version, //
-                                                   &T::method, //
-                                                   &T::params, //
-                                                   &T::id);
+                                                      &T::method, //
+                                                      &T::params, //
+                                                      &T::id);
       };
    };
 
@@ -202,8 +202,9 @@ namespace glz_ko::rpc
       };
 
       template <class call_return_t>
-      concept call_return_type =
-         requires { requires glz_ko::is_any_of<call_return_t, std::string, std::vector<response_t<glz_ko::raw_json>>>; };
+      concept call_return_type = requires {
+         requires glz_ko::is_any_of<call_return_t, std::string, std::vector<response_t<glz_ko::raw_json>>>;
+      };
    }
 
    template <concepts::method_type Method>
@@ -484,9 +485,10 @@ namespace glz_ko::rpc
                // The batch is abandoned rather than truncated -- a caller must not mistake a partial
                // array for a complete one.
                if (total_size > max_batch_response_size) {
-                  return std::vector<response_t<glz_ko::raw_json>>{raw_response_t{rpc::error{error_e::server_error_lower,
-                                                                                          "Batch response exceeds "
-                                                                                          "max_batch_response_size"}}};
+                  return std::vector<response_t<glz_ko::raw_json>>{
+                     raw_response_t{rpc::error{error_e::server_error_lower,
+                                               "Batch response exceeds "
+                                               "max_batch_response_size"}}};
                }
                return_vec.emplace_back(std::move(response.value()));
             }

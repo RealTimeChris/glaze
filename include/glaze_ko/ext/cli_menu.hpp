@@ -109,7 +109,8 @@ namespace glz_ko
                            (value.*func)();
                         }
                         else {
-                           const auto result = glz_ko::write<Opts>((value.*func)()).value_or("result serialization error");
+                           const auto result =
+                              glz_ko::write<Opts>((value.*func)()).value_or("result serialization error");
                            std::printf("%.*s\n", int(result.size()), result.data());
                         }
                      }
@@ -201,7 +202,8 @@ namespace glz_ko
                               func(params);
                            }
                            else {
-                              const auto result = glz_ko::write<Opts>(func(params)).value_or("result serialization error");
+                              const auto result =
+                                 glz_ko::write<Opts>(func(params)).value_or("result serialization error");
                               std::printf("%.*s\n", int(result.size()), result.data());
                            }
                         }

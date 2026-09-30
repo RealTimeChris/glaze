@@ -242,7 +242,7 @@ namespace glz_ko
    template <auto Opts, auto FieldOpts, class T, size_t I, class Value, class... SelectedIndex>
       requires(glaze_object_t<T> || reflectable<T>)
    GLZKO_ALWAYS_INLINE void decode_field_value(Value&& value, is_context auto&& ctx, auto&& it, auto&& end,
-                                             SelectedIndex&&... selected_index)
+                                               SelectedIndex&&... selected_index)
    {
       // Check for null value skipping on read
       if constexpr (check_skip_null_members_on_read(Opts)) {
@@ -378,7 +378,7 @@ namespace glz_ko
    template <auto Opts, class T, class Value, class... SelectedIndex>
       requires(glaze_object_t<T> || reflectable<T>)
    GLZKO_ALWAYS_INLINE constexpr void parse_and_invoke(Value&& value, is_context auto&& ctx, auto&& it, auto&& end,
-                                                     SelectedIndex&&... selected_index)
+                                                       SelectedIndex&&... selected_index)
    {
       constexpr auto N = reflect<T>::size;
 

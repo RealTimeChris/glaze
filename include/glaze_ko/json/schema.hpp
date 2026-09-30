@@ -329,43 +329,43 @@ struct glz_ko::meta<glz_ko::schema>
 #pragma clang diagnostic ignored "-Wmissing-braces"
 #endif
    [[maybe_unused]] static constexpr glz_ko::tuple value{&T::type, //
-                                                      &T::ref, //
-                                                      &T::properties, //
-                                                      &T::prefixItems, //
-                                                      &T::items, //
-                                                      &T::additionalProperties, //
-                                                      &T::defs, //
-                                                      &T::oneOf, //
-                                                      &T::anyOf, //
-                                                      glz_ko::unquoted<&T::examples>, //
-                                                      &T::required, //
-                                                      &T::title, //
-                                                      &T::description, //
-                                                      &T::defaultValue, //
-                                                      &T::deprecated, //
-                                                      &T::readOnly, //
-                                                      &T::writeOnly, //
-                                                      &T::constant, //
-                                                      &T::minLength, //
-                                                      &T::maxLength, //
-                                                      &T::pattern, //
-                                                      &T::format, //
-                                                      &T::minimum, //
-                                                      &T::maximum, //
-                                                      &T::exclusiveMinimum, //
-                                                      &T::exclusiveMaximum, //
-                                                      &T::multipleOf, //
-                                                      &T::minProperties, //
-                                                      &T::maxProperties, //
-                                                      // &T::dependent_required, //
-                                                      &T::minItems, //
-                                                      &T::maxItems, //
-                                                      &T::minContains, //
-                                                      &T::maxContains, //
-                                                      &T::uniqueItems, //
-                                                      &T::enumeration, //
-                                                      &T::ExtUnits, //
-                                                      &T::ExtAdvanced};
+                                                         &T::ref, //
+                                                         &T::properties, //
+                                                         &T::prefixItems, //
+                                                         &T::items, //
+                                                         &T::additionalProperties, //
+                                                         &T::defs, //
+                                                         &T::oneOf, //
+                                                         &T::anyOf, //
+                                                         glz_ko::unquoted<&T::examples>, //
+                                                         &T::required, //
+                                                         &T::title, //
+                                                         &T::description, //
+                                                         &T::defaultValue, //
+                                                         &T::deprecated, //
+                                                         &T::readOnly, //
+                                                         &T::writeOnly, //
+                                                         &T::constant, //
+                                                         &T::minLength, //
+                                                         &T::maxLength, //
+                                                         &T::pattern, //
+                                                         &T::format, //
+                                                         &T::minimum, //
+                                                         &T::maximum, //
+                                                         &T::exclusiveMinimum, //
+                                                         &T::exclusiveMaximum, //
+                                                         &T::multipleOf, //
+                                                         &T::minProperties, //
+                                                         &T::maxProperties, //
+                                                         // &T::dependent_required, //
+                                                         &T::minItems, //
+                                                         &T::maxItems, //
+                                                         &T::minContains, //
+                                                         &T::maxContains, //
+                                                         &T::uniqueItems, //
+                                                         &T::enumeration, //
+                                                         &T::ExtUnits, //
+                                                         &T::ExtAdvanced};
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif

@@ -151,7 +151,7 @@ namespace glz_ko
 
       template <class B>
       GLZKO_ALWAYS_INLINE bool write_element_prefix(is_context auto& ctx, uint8_t type_byte, std::string_view key, B& b,
-                                                  size_t& ix) noexcept
+                                                    size_t& ix) noexcept
       {
          if (!ensure_space(ctx, b, ix + 2 + key.size() + write_padding_bytes)) [[unlikely]] {
             return false;
@@ -435,7 +435,8 @@ namespace glz_ko
       static constexpr uint8_t type_code = bson::type::object_id;
 
       template <auto Opts>
-      GLZKO_ALWAYS_INLINE static void op(const bson::object_id& value, is_context auto&& ctx, auto&& b, auto& ix) noexcept
+      GLZKO_ALWAYS_INLINE static void op(const bson::object_id& value, is_context auto&& ctx, auto&& b,
+                                         auto& ix) noexcept
       {
          if (!ensure_space(ctx, b, ix + 12 + write_padding_bytes)) [[unlikely]] {
             return;
@@ -450,7 +451,8 @@ namespace glz_ko
       static constexpr uint8_t type_code = bson::type::datetime;
 
       template <auto Opts>
-      GLZKO_ALWAYS_INLINE static void op(const bson::datetime& value, is_context auto&& ctx, auto&& b, auto& ix) noexcept
+      GLZKO_ALWAYS_INLINE static void op(const bson::datetime& value, is_context auto&& ctx, auto&& b,
+                                         auto& ix) noexcept
       {
          if (!ensure_space(ctx, b, ix + 8 + write_padding_bytes)) [[unlikely]] {
             return;
@@ -465,7 +467,8 @@ namespace glz_ko
       static constexpr uint8_t type_code = bson::type::timestamp;
 
       template <auto Opts>
-      GLZKO_ALWAYS_INLINE static void op(const bson::timestamp& value, is_context auto&& ctx, auto&& b, auto& ix) noexcept
+      GLZKO_ALWAYS_INLINE static void op(const bson::timestamp& value, is_context auto&& ctx, auto&& b,
+                                         auto& ix) noexcept
       {
          if (!ensure_space(ctx, b, ix + 8 + write_padding_bytes)) [[unlikely]] {
             return;
@@ -617,7 +620,7 @@ namespace glz_ko
 
       template <auto Opts>
       GLZKO_ALWAYS_INLINE static void op(const std::chrono::system_clock::time_point& value, is_context auto&& ctx,
-                                       auto&& b, auto& ix) noexcept
+                                         auto&& b, auto& ix) noexcept
       {
          if (!ensure_space(ctx, b, ix + 8 + write_padding_bytes)) [[unlikely]] {
             return;
@@ -690,7 +693,7 @@ namespace glz_ko
       // skip_default_members on a default-valued field, etc.).
       template <class T, auto Opts, size_t I, class Value, class Tie>
       GLZKO_ALWAYS_INLINE bool should_skip_field_runtime(const Value& value, [[maybe_unused]] const Tie& t,
-                                                       [[maybe_unused]] is_context auto& ctx) noexcept
+                                                         [[maybe_unused]] is_context auto& ctx) noexcept
       {
          using val_t = field_t<T, I>;
 

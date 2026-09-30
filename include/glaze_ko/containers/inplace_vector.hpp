@@ -723,13 +723,15 @@ namespace glz_ko
 
       constexpr reference at(size_type n) // freestanding-deleted
       {
-         if (n >= this->storage_size()) GLZKO_THROW_OR_ABORT(std::out_of_range("inplace_vector::at: index out of range"));
+         if (n >= this->storage_size())
+            GLZKO_THROW_OR_ABORT(std::out_of_range("inplace_vector::at: index out of range"));
          return this->data_ptr()[n];
       }
 
       constexpr const_reference at(size_type n) const // freestanding-deleted
       {
-         if (n >= this->storage_size()) GLZKO_THROW_OR_ABORT(std::out_of_range("inplace_vector::at: index out of range"));
+         if (n >= this->storage_size())
+            GLZKO_THROW_OR_ABORT(std::out_of_range("inplace_vector::at: index out of range"));
          return this->data_ptr()[n];
       }
 

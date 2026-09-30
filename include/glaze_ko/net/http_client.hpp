@@ -717,8 +717,8 @@ namespace glz_ko
          // that authenticate the caller do not travel with it - curl's CVE-2018-1000007 was
          // exactly this leak. A caller-pinned Host belonged to the old origin too, and
          // keeping it would send the new origin a request addressed to the old one.
-         const bool same_origin = glz_ko::striequal(target->host, request.url.host) && target->port == request.url.port &&
-                                  target->protocol == request.url.protocol;
+         const bool same_origin = glz_ko::striequal(target->host, request.url.host) &&
+                                  target->port == request.url.port && target->protocol == request.url.protocol;
          if (!same_origin) {
             request.headers.erase("Authorization");
             request.headers.erase("Proxy-Authorization");

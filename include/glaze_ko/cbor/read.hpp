@@ -26,7 +26,7 @@ namespace glz_ko
    {
       // Decode CBOR argument (variable-length unsigned integer)
       [[nodiscard]] GLZKO_ALWAYS_INLINE uint64_t decode_arg(is_context auto& ctx, auto& it, auto end,
-                                                          uint8_t additional_info) noexcept
+                                                            uint8_t additional_info) noexcept
       {
          using namespace cbor;
 

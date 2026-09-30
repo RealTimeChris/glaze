@@ -16,7 +16,7 @@ namespace glz_ko::detail
 {
    template <class Data, class WriteEscape>
    GLZKO_ALWAYS_INLINE void sse2_string_escape(const char*& c, const char* e, Data*& data, size_t n,
-                                             WriteEscape&& write_escape)
+                                               WriteEscape&& write_escape)
    {
       // SSE2: 16 bytes at a time with direct comparison instructions
       if (n > 15) {

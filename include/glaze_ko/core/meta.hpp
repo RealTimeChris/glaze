@@ -185,7 +185,8 @@ namespace glz_ko
       consteval auto compute_value_indices()
       {
          return []<size_t... I>(std::index_sequence<I...>) {
-            constexpr size_t count = (static_cast<size_t>(!object_key_like<glz_ko::tuple_element_t<I, Tuple>>) + ... + 0);
+            constexpr size_t count =
+               (static_cast<size_t>(!object_key_like<glz_ko::tuple_element_t<I, Tuple>>) + ... + 0);
             std::array<size_t, count> result{};
             size_t idx = 0;
             (([&] {

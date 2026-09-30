@@ -15,7 +15,7 @@ namespace glz_ko
       // Skip argument bytes and return the argument value
       template <auto Opts>
       [[nodiscard]] GLZKO_ALWAYS_INLINE static uint64_t skip_argument(is_context auto& ctx, auto& it, auto end,
-                                                                    uint8_t additional_info) noexcept
+                                                                      uint8_t additional_info) noexcept
       {
          using namespace cbor;
 

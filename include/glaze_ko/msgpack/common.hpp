@@ -82,7 +82,10 @@ namespace glz_ko::msgpack
 
    GLZKO_ALWAYS_INLINE constexpr bool is_fixmap(uint8_t tag) noexcept { return (tag & fixmap_mask) == fixmap_bits; }
 
-   GLZKO_ALWAYS_INLINE constexpr bool is_fixarray(uint8_t tag) noexcept { return (tag & fixarray_mask) == fixarray_bits; }
+   GLZKO_ALWAYS_INLINE constexpr bool is_fixarray(uint8_t tag) noexcept
+   {
+      return (tag & fixarray_mask) == fixarray_bits;
+   }
 
    GLZKO_ALWAYS_INLINE constexpr bool is_fixstr(uint8_t tag) noexcept { return (tag & fixstr_mask) == fixstr_bits; }
 
@@ -201,7 +204,7 @@ namespace glz_ko::msgpack
 
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_ext_header(is_context auto& ctx, uint8_t tag, It& it, const It& end, size_t& length,
-                                          int8_t& type) noexcept
+                                            int8_t& type) noexcept
    {
       switch (tag) {
       case fixext1:
@@ -297,7 +300,7 @@ namespace glz_ko::msgpack
 
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_str_length(is_context auto& ctx, uint8_t tag, It& it, const It& end,
-                                          size_t& out) noexcept
+                                            size_t& out) noexcept
    {
       if (is_fixstr(tag)) {
          out = tag & 0x1F;
@@ -374,7 +377,7 @@ namespace glz_ko::msgpack
 
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_bin_length(is_context auto& ctx, uint8_t tag, It& it, const It& end,
-                                          size_t& out) noexcept
+                                            size_t& out) noexcept
    {
       switch (tag) {
       case bin8: {
@@ -409,7 +412,7 @@ namespace glz_ko::msgpack
 
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_array_length(is_context auto& ctx, uint8_t tag, It& it, const It& end,
-                                            size_t& out) noexcept
+                                              size_t& out) noexcept
    {
       if (is_fixarray(tag)) {
          out = tag & 0x0F;
@@ -440,7 +443,7 @@ namespace glz_ko::msgpack
 
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_map_length(is_context auto& ctx, uint8_t tag, It& it, const It& end,
-                                          size_t& out) noexcept
+                                            size_t& out) noexcept
    {
       if (is_fixmap(tag)) {
          out = tag & 0x0F;

@@ -343,7 +343,7 @@ namespace glz_ko
 
    template <class SrcChar, class DstChar = SrcChar>
    [[nodiscard]] GLZKO_ALWAYS_INLINE unicode_result handle_unicode_code_point(const SrcChar*& it, DstChar*& dst,
-                                                                            const SrcChar* end) noexcept
+                                                                              const SrcChar* end) noexcept
    {
       using namespace unicode;
 
@@ -869,7 +869,7 @@ namespace glz_ko
    // and always validate.
    template <auto Opts>
    GLZKO_ALWAYS_INLINE bool validate_utf8_span(is_context auto&& ctx, const auto* start, const auto* fin,
-                                             const uint64_t ascii_acc = repeat_byte8(0b10000000)) noexcept
+                                               const uint64_t ascii_acc = repeat_byte8(0b10000000)) noexcept
    {
       if constexpr (not check_validate_utf8(Opts)) {
          // Everything the caller computed for us is dead, which lets its scan loop drop the
@@ -1776,7 +1776,7 @@ namespace glz_ko
       GLZKO_ALWAYS_INLINE static bool is_continuation(const uint32_t byte) noexcept { return (byte & 0xC0) == 0x80; }
 
       GLZKO_ALWAYS_INLINE static bool is_in_range(const uint32_t byte, const uint32_t lower_bound,
-                                                const uint32_t upper_bound) noexcept
+                                                  const uint32_t upper_bound) noexcept
       {
          return byte - lower_bound <= upper_bound - lower_bound;
       }
@@ -1927,8 +1927,8 @@ namespace glz_ko
       }
 
       GLZKO_ALWAYS_INLINE static bool consume_non_ascii_checked(const uint8_t*& it, const uint8_t* end,
-                                                              uint32_t& remaining, uint32_t& lower_bound,
-                                                              uint32_t& upper_bound) noexcept
+                                                                uint32_t& remaining, uint32_t& lower_bound,
+                                                                uint32_t& upper_bound) noexcept
       {
          // Boundary-safe version for small chunks and tails.
          // May leave pending state instead of failing at the buffer end
@@ -2019,7 +2019,7 @@ namespace glz_ko
       }
 
       GLZKO_ALWAYS_INLINE static bool consume_small(const uint8_t*& it, const uint8_t* end, uint32_t& remaining,
-                                                  uint32_t& lower_bound, uint32_t& upper_bound) noexcept
+                                                    uint32_t& lower_bound, uint32_t& upper_bound) noexcept
       {
          // Small-buffer path. Avoid the larger bulk-loop setup and still
          // use 8-byte ASCII skipping when useful
@@ -2045,7 +2045,7 @@ namespace glz_ko
       }
 
       GLZKO_ALWAYS_INLINE static bool consume_tail(const uint8_t*& it, const uint8_t* end, uint32_t& remaining,
-                                                 uint32_t& lower_bound, uint32_t& upper_bound) noexcept
+                                                   uint32_t& lower_bound, uint32_t& upper_bound) noexcept
       {
          // Tail normally should be 0..3 bytes after bulk loop
          while (it != end) {
@@ -2067,7 +2067,7 @@ namespace glz_ko
       }
 
       GLZKO_ALWAYS_INLINE static bool consume_pending(const uint8_t*& it, const uint8_t* end, uint32_t& remaining,
-                                                    uint32_t& lower_bound, uint32_t& upper_bound) noexcept
+                                                      uint32_t& lower_bound, uint32_t& upper_bound) noexcept
       {
          // Continue a partially consumed codepoint.
          // Only the first continuation byte may have a tightened bound
@@ -2086,7 +2086,7 @@ namespace glz_ko
       }
 
       GLZKO_ALWAYS_INLINE void store_pending(const uint32_t remaining, const uint32_t lower_bound,
-                                           const uint32_t upper_bound) noexcept
+                                             const uint32_t upper_bound) noexcept
       {
          remaining_ = static_cast<uint8_t>(remaining);
          lower_bound_ = static_cast<uint8_t>(lower_bound);

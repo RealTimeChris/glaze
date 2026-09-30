@@ -13,8 +13,8 @@ namespace glz_ko
    // Assuming that you use no more than 19 digits, this will
    // parse an ASCII string.
    template <bool null_terminated, class UC>
-   GLZKO_ALWAYS_INLINE constexpr glz_ko::fast_float::parsed_number_string_t<UC> parse_number_string(UC const* p,
-                                                                                               UC const* pend) noexcept
+   GLZKO_ALWAYS_INLINE constexpr glz_ko::fast_float::parsed_number_string_t<UC> parse_number_string(
+      UC const* p, UC const* pend) noexcept
    {
       using namespace glz_ko::fast_float;
       static constexpr UC decimal_point = '.';

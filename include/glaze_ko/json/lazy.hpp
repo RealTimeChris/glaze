@@ -87,7 +87,7 @@ namespace glz_ko
 
       template <size_t... I>
       GLZKO_ALWAYS_INLINE const char* find_next_structural(const char* p, const char* end,
-                                                         std::index_sequence<I...>) noexcept
+                                                           std::index_sequence<I...>) noexcept
       {
          return glz_ko::find_first_of<lazy_structural_chars[I]...>(p, end);
       }

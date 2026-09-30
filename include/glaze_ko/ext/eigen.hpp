@@ -40,7 +40,7 @@ namespace glz_ko
       // exceeds the buffer. Reject it here, mirroring the fixed-extent check in from<CBOR, T>.
       template <class T>
       [[nodiscard]] GLZKO_ALWAYS_INLINE bool invalid_extents(const std::array<Eigen::Index, 2>& extents,
-                                                           is_context auto& ctx) noexcept
+                                                             is_context auto& ctx) noexcept
       {
          if (extents[0] < 0 || extents[1] < 0) [[unlikely]] {
             ctx.error = error_code::syntax_error;

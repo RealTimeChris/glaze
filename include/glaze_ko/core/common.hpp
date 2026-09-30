@@ -412,8 +412,8 @@ namespace glz_ko
    // Check if type opts out of automatic reflection
    // Users can set glaze_reflect = false either:
    // 1. On the type itself: static constexpr bool glaze_reflect = false;
-   // 2. Via glz_ko::meta specialization: template<> struct glz_ko::meta<T> { static constexpr bool glaze_reflect = false; };
-   // This allows users to define custom glz_ko::to/from specializations without editing the library
+   // 2. Via glz_ko::meta specialization: template<> struct glz_ko::meta<T> { static constexpr bool glaze_reflect =
+   // false; }; This allows users to define custom glz_ko::to/from specializations without editing the library
    template <class T>
    concept is_no_reflect = requires { requires std::remove_cvref_t<T>::glaze_reflect == false; } ||
                            requires { requires meta<std::decay_t<T>>::glaze_reflect == false; };

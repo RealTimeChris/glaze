@@ -41,8 +41,8 @@ namespace glz_ko
       // Write a scalar element whose payload is already known (type + exact bytes).
       // Emits a minimal header followed by the payload bytes.
       template <class B, class IX>
-      GLZKO_ALWAYS_INLINE bool write_scalar(is_context auto& ctx, uint8_t type_code, const char* data, size_t size, B& b,
-                                          IX& ix)
+      GLZKO_ALWAYS_INLINE bool write_scalar(is_context auto& ctx, uint8_t type_code, const char* data, size_t size,
+                                            B& b, IX& ix)
       {
          const size_t hdr_bytes = jsonb::header_bytes_for_payload(size);
          if (!ensure_space(ctx, b, ix + hdr_bytes + size + write_padding_bytes)) [[unlikely]] {

@@ -73,7 +73,8 @@ namespace glz_ko
       // Return a string_view over a cstring in the buffer. Advances `it` to
       // just past the trailing 0x00.
       template <class It, class End>
-      GLZKO_ALWAYS_INLINE bool read_cstring(is_context auto& ctx, It& it, const End& end, std::string_view& out) noexcept
+      GLZKO_ALWAYS_INLINE bool read_cstring(is_context auto& ctx, It& it, const End& end,
+                                            std::string_view& out) noexcept
       {
          auto start = it;
          while (it < end) {
@@ -93,7 +94,7 @@ namespace glz_ko
       // the input buffer; lifetime matches the buffer.
       template <class It, class End>
       GLZKO_ALWAYS_INLINE bool read_bson_string(is_context auto& ctx, It& it, const End& end,
-                                              std::string_view& out) noexcept
+                                                std::string_view& out) noexcept
       {
          int32_t len{};
          if (!read_le<int32_t>(ctx, it, end, len)) return false;
@@ -200,7 +201,8 @@ namespace glz_ko
    struct from<BSON, bool>
    {
       template <auto Opts, class It, class End>
-      GLZKO_ALWAYS_INLINE static void op(bool& value, uint8_t tag, is_context auto& ctx, It& it, const End& end) noexcept
+      GLZKO_ALWAYS_INLINE static void op(bool& value, uint8_t tag, is_context auto& ctx, It& it,
+                                         const End& end) noexcept
       {
          if (tag != bson::type::boolean) [[unlikely]] {
             ctx.error = error_code::syntax_error;
@@ -466,7 +468,7 @@ namespace glz_ko
    {
       template <auto Opts, class It, class End>
       GLZKO_ALWAYS_INLINE static void op(bson::object_id& value, uint8_t tag, is_context auto& ctx, It& it,
-                                       const End& end) noexcept
+                                         const End& end) noexcept
       {
          if (tag != bson::type::object_id) [[unlikely]] {
             ctx.error = error_code::syntax_error;
@@ -486,7 +488,7 @@ namespace glz_ko
    {
       template <auto Opts, class It, class End>
       GLZKO_ALWAYS_INLINE static void op(bson::datetime& value, uint8_t tag, is_context auto& ctx, It& it,
-                                       const End& end) noexcept
+                                         const End& end) noexcept
       {
          if (tag != bson::type::datetime) [[unlikely]] {
             ctx.error = error_code::syntax_error;
@@ -501,7 +503,7 @@ namespace glz_ko
    {
       template <auto Opts, class It, class End>
       GLZKO_ALWAYS_INLINE static void op(bson::timestamp& value, uint8_t tag, is_context auto& ctx, It& it,
-                                       const End& end) noexcept
+                                         const End& end) noexcept
       {
          if (tag != bson::type::timestamp) [[unlikely]] {
             ctx.error = error_code::syntax_error;
@@ -683,8 +685,8 @@ namespace glz_ko
    struct from<BSON, std::chrono::system_clock::time_point>
    {
       template <auto Opts, class It, class End>
-      GLZKO_ALWAYS_INLINE static void op(std::chrono::system_clock::time_point& value, uint8_t tag, is_context auto& ctx,
-                                       It& it, const End& end) noexcept
+      GLZKO_ALWAYS_INLINE static void op(std::chrono::system_clock::time_point& value, uint8_t tag,
+                                         is_context auto& ctx, It& it, const End& end) noexcept
       {
          if (tag != bson::type::datetime) [[unlikely]] {
             ctx.error = error_code::syntax_error;

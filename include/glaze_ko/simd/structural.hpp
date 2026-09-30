@@ -112,7 +112,7 @@ namespace glz_ko::detail::structural
    // NEON has no movemask. Weighting each lane by its bit position and folding with pairwise adds
    // gathers the 64 lane results into one register, four lanes per add, in four steps.
    GLZKO_ALWAYS_INLINE uint64_t to_bitmask(const uint8x16_t a, const uint8x16_t b, const uint8x16_t c,
-                                         const uint8x16_t d) noexcept
+                                           const uint8x16_t d) noexcept
    {
       static constexpr uint8_t bits_array[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
                                                0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};

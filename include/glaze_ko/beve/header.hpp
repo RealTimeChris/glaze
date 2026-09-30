@@ -43,8 +43,8 @@ namespace glz_ko
    // the fit is tested as count > (remaining - padding) / element_size, a division that cannot
    // overflow.
    [[nodiscard]] GLZKO_ALWAYS_INLINE bool typed_array_out_of_bounds(is_context auto& ctx, auto&& it, auto&& end,
-                                                                  size_t count, size_t element_size,
-                                                                  size_t padding = 0) noexcept
+                                                                    size_t count, size_t element_size,
+                                                                    size_t padding = 0) noexcept
    {
       const uint64_t available = uint64_t(end - it);
       if constexpr (sizeof(size_t) > sizeof(uint32_t)) {
@@ -359,7 +359,7 @@ namespace glz_ko
    // A packed boolean array stores its SIZE bits LSB-first in ceil(SIZE / 8) bytes. When SIZE is not a multiple
    // of 8, the unused high bits of the final byte are padding and must be zero.
    [[nodiscard]] GLZKO_ALWAYS_INLINE constexpr bool packed_bool_padding_is_zero(const uint8_t last_byte,
-                                                                              const size_t count) noexcept
+                                                                                const size_t count) noexcept
    {
       const size_t used_bits = count % 8;
       return used_bits == 0 || (last_byte >> used_bits) == 0;
@@ -378,7 +378,7 @@ namespace glz_ko
    // On success `it` points at the first component, the whole payload is known to be in bounds, and the
    // number of complex elements (SIZE / 2) is returned.
    [[nodiscard]] GLZKO_ALWAYS_INLINE size_t read_aligned_complex_header(is_context auto&& ctx, auto&& it, auto end,
-                                                                      const uint8_t complex_header) noexcept
+                                                                        const uint8_t complex_header) noexcept
    {
       if (invalid_end(ctx, it, end)) {
          return 0;

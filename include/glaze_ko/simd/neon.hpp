@@ -28,7 +28,7 @@ namespace glz_ko::detail
 
    template <class Data, class WriteEscape>
    GLZKO_ALWAYS_INLINE void neon_string_escape(const char*& c, const char* e, Data*& data, size_t n,
-                                             WriteEscape&& write_escape)
+                                               WriteEscape&& write_escape)
    {
       if (n > 15) {
          const uint8x16_t quote_vec = vdupq_n_u8('"');

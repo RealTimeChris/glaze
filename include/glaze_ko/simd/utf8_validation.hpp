@@ -159,8 +159,8 @@ namespace glz_ko::detail::utf8_simd
       std::memset(r.b, v, width);
       return r;
    }
-#define GLZKO_UTF8_GENERIC_BINOP(name, op)                            \
-   GLZKO_ALWAYS_INLINE vec name(vec a, vec c) noexcept                \
+#define GLZKO_UTF8_GENERIC_BINOP(name, op)                          \
+   GLZKO_ALWAYS_INLINE vec name(vec a, vec c) noexcept              \
    {                                                                \
       vec r;                                                        \
       for (size_t i = 0; i < width; ++i) r.b[i] = a.b[i] op c.b[i]; \

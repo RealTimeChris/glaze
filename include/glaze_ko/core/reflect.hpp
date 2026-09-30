@@ -893,8 +893,9 @@ namespace glz_ko
             else if constexpr (is_specialization_v<V, custom_t>) {
                using From = typename V::from_t;
 
-               // If we are reading a glz_ko::custom_t, we must deduce the input argument and not require the key if it is
-               // optional This allows error_on_missing_keys to work properly with glz_ko::custom_t wrapping optional types
+               // If we are reading a glz_ko::custom_t, we must deduce the input argument and not require the key if it
+               // is optional This allows error_on_missing_keys to work properly with glz_ko::custom_t wrapping optional
+               // types
                constexpr bool nullable_in_custom = custom_type_is_nullable<V, From>();
 
                fields[I] = !Opts.skip_null_members || !(std::same_as<From, skip> || nullable_in_custom);

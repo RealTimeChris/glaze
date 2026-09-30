@@ -66,7 +66,7 @@ namespace glz_ko::simple_float
       // - Exponent must have at least one digit
       template <bool null_terminated>
       GLZKO_ALWAYS_INLINE constexpr const char* parse_decimal_strict(const char* buf, const char* end,
-                                                                   decimal_number& out) noexcept
+                                                                     decimal_number& out) noexcept
       {
          const char* p = buf;
 
@@ -457,7 +457,7 @@ namespace glz_ko::simple_float
       // Returns high 128 bits of the 192-bit product
       // exp is updated: exp_out = exp_in + p.exp + 64
       GLZKO_ALWAYS_INLINE constexpr void mul64_pow5(uint64_t m, const pow5_128& p, uint64_t& rh, uint64_t& rl,
-                                                  int32_t& exp, bool& round_bit, bool& sticky_bit) noexcept
+                                                    int32_t& exp, bool& round_bit, bool& sticky_bit) noexcept
       {
          // m × (p.hi : p.lo) = m×p.hi × 2^64 + m×p.lo
          // This is 64 × 128 = 192 bits, we keep high 128
@@ -482,7 +482,7 @@ namespace glz_ko::simple_float
 
       // Multiply two 128-bit numbers, return high 128 bits of 256-bit product
       GLZKO_ALWAYS_INLINE constexpr void mul128(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl, uint64_t& rh,
-                                              uint64_t& rl, bool& round_bit, bool& sticky_bit) noexcept
+                                                uint64_t& rl, bool& round_bit, bool& sticky_bit) noexcept
       {
          // (ah:al) × (bh:bl) = ah×bh × 2^128 + (ah×bl + al×bh) × 2^64 + al×bl
          // We need bits 255..128 (high 128 bits)
@@ -574,7 +574,7 @@ namespace glz_ko::simple_float
 
       // Convert 128-bit mantissa + binary exponent to double with correct IEEE 754 rounding
       GLZKO_ALWAYS_INLINE constexpr double assemble_double(uint64_t hi, uint64_t lo, int32_t exp2, bool negative,
-                                                         bool round_bit, bool sticky_bit) noexcept
+                                                           bool round_bit, bool sticky_bit) noexcept
       {
          // Normalize: ensure MSB of hi is set
          if (hi == 0) {
@@ -717,7 +717,7 @@ namespace glz_ko::simple_float
 
       // Convert 128-bit mantissa + binary exponent to float
       GLZKO_ALWAYS_INLINE constexpr float assemble_float(uint64_t hi, uint64_t lo, int32_t exp2, bool negative,
-                                                       bool round_bit, bool sticky_bit) noexcept
+                                                         bool round_bit, bool sticky_bit) noexcept
       {
          // Similar to assemble_double but for 24-bit mantissa
 
@@ -906,7 +906,7 @@ namespace glz_ko::simple_float
       // Hybrid pow5 application: uses compact table for common exponents, binary exp for extreme values
       // This gives O(1) performance for typical JSON numbers (exponents -16..+16) using 594 bytes
       GLZKO_ALWAYS_INLINE constexpr void apply_pow5_hybrid(uint64_t mantissa, int32_t q, uint64_t& rh, uint64_t& rl,
-                                                         int32_t& exp2, bool& round_bit, bool& sticky_bit) noexcept
+                                                           int32_t& exp2, bool& round_bit, bool& sticky_bit) noexcept
       {
          // Check if we can use the compact table (exponents -16 to +16)
          if (q >= pow5_compact_min && q <= pow5_compact_max) {
@@ -1002,7 +1002,7 @@ namespace glz_ko::simple_float
       // Fast float parsing for common cases (small exponents, normal values)
       // Returns true if fast path succeeded, false if 128-bit path needed
       GLZKO_ALWAYS_INLINE bool try_fast_float_parse(uint64_t mantissa, int32_t exp10, bool negative,
-                                                  float& result) noexcept
+                                                    float& result) noexcept
       {
          // Fast path uses double precision arithmetic which has 53-bit mantissa.
          // For float (24-bit mantissa), this gives us ~29 bits of headroom for error.
@@ -1345,7 +1345,8 @@ namespace glz_ko::simple_float
    // Returns: {pointer past last parsed char, error code}
    // Uses strict JSON-compliant parsing (RFC 8259)
    template <bool null_terminated, class T>
-   GLZKO_ALWAYS_INLINE constexpr std::from_chars_result from_chars(const char* first, const char* last, T& value) noexcept
+   GLZKO_ALWAYS_INLINE constexpr std::from_chars_result from_chars(const char* first, const char* last,
+                                                                   T& value) noexcept
    {
       static_assert(std::is_floating_point_v<T>, "T must be a floating-point type");
 

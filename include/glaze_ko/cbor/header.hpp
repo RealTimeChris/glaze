@@ -119,7 +119,8 @@ namespace glz_ko::cbor
    }
 
    // Construct initial byte from major type and additional info
-   [[nodiscard]] GLZKO_ALWAYS_INLINE constexpr uint8_t initial_byte(uint8_t major_type, uint8_t additional_info) noexcept
+   [[nodiscard]] GLZKO_ALWAYS_INLINE constexpr uint8_t initial_byte(uint8_t major_type,
+                                                                    uint8_t additional_info) noexcept
    {
       return static_cast<uint8_t>((major_type << 5) | (additional_info & 0x1f));
    }

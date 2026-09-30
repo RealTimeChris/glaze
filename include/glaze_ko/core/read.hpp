@@ -127,7 +127,7 @@ namespace glz_ko
    //     glz_ko::raw_json) must see every byte; they complete without error and never reach this.
    template <auto Opts>
    GLZKO_ALWAYS_INLINE void finalize_top_level_read(is_context auto&& ctx, const char* start, const char* it,
-                                                  const char* end) noexcept
+                                                    const char* end) noexcept
    {
       if constexpr (Opts.format == JSON && !check_null_terminated(Opts)) {
          // Deliberately not [[unlikely]]: a body that ends with the buffer lands here on every

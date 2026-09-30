@@ -38,8 +38,9 @@
 namespace glz_ko::msgpack::detail
 {
    template <class It>
-   GLZKO_ALWAYS_INLINE bool read_integer_value(is_context auto& ctx, uint8_t tag, It& it, const It& end, bool& is_signed,
-                                             int64_t& signed_value, uint64_t& unsigned_value) noexcept
+   GLZKO_ALWAYS_INLINE bool read_integer_value(is_context auto& ctx, uint8_t tag, It& it, const It& end,
+                                               bool& is_signed, int64_t& signed_value,
+                                               uint64_t& unsigned_value) noexcept
    {
       if (is_positive_fixint(tag)) {
          is_signed = false;
@@ -133,7 +134,7 @@ namespace glz_ko::msgpack::detail
 
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_string_view(is_context auto& ctx, uint8_t tag, It& it, const It& end,
-                                           std::string_view& out) noexcept
+                                             std::string_view& out) noexcept
    {
       size_t len{};
       if (!read_str_length(ctx, tag, it, end, len)) {
@@ -150,7 +151,7 @@ namespace glz_ko::msgpack::detail
 
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_binary_view(is_context auto& ctx, uint8_t tag, It& it, const It& end,
-                                           std::string_view& out) noexcept
+                                             std::string_view& out) noexcept
    {
       size_t len{};
       if (!read_bin_length(ctx, tag, it, end, len)) {

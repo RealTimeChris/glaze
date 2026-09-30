@@ -29,7 +29,7 @@ namespace glz_ko
    namespace detail
    {
       [[nodiscard]] GLZKO_ALWAYS_INLINE constexpr size_t peek_compressed_int_size(const uint8_t* data,
-                                                                                size_t available) noexcept
+                                                                                  size_t available) noexcept
       {
          if (available == 0) return 0;
          const uint8_t config = data[0] & 0b000000'11;
@@ -37,7 +37,7 @@ namespace glz_ko
       }
 
       [[nodiscard]] GLZKO_ALWAYS_INLINE constexpr size_t peek_compressed_int_value(const uint8_t* data,
-                                                                                 size_t available) noexcept
+                                                                                   size_t available) noexcept
       {
          if (available == 0) return 0;
 

@@ -355,7 +355,7 @@ namespace glz_ko::msgpack::detail
 
    template <class B>
    GLZKO_ALWAYS_INLINE bool dump_raw_bytes(is_context auto& ctx, const char* data, size_t size, B& b,
-                                         size_t& ix) noexcept(not vector_like<B>)
+                                           size_t& ix) noexcept(not vector_like<B>)
    {
       if (size == 0) {
          return true;

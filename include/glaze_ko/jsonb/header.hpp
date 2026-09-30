@@ -135,7 +135,7 @@ namespace glz_ko::jsonb
    // Advances `it` past the header on success.
    template <class It>
    GLZKO_ALWAYS_INLINE bool read_header(is_context auto& ctx, It& it, It end, uint8_t& type_code,
-                                      uint64_t& payload_size) noexcept
+                                        uint64_t& payload_size) noexcept
    {
       if (it >= end) [[unlikely]] {
          ctx.error = error_code::unexpected_end;
