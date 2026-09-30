@@ -10,7 +10,7 @@ if(BUILD_TESTING)
   add_subdirectory(tests)
 endif()
 
-if (glaze_ENABLE_FUZZING)
+if (glaze_ko_ENABLE_FUZZING)
   add_subdirectory(fuzzing)
 endif()
 

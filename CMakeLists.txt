@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.31)
 include(cmake/prelude.cmake)
 
 project(
-    glaze
+    glaze_ko
     VERSION 9.0.0
     LANGUAGES CXX
 )
@@ -15,13 +15,13 @@ if (PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
-add_library(glaze_glaze INTERFACE)
-add_library(glaze::glaze ALIAS glaze_glaze)
+add_library(glaze_ko_glaze_ko INTERFACE)
+add_library(glaze_ko::glaze_ko ALIAS glaze_ko_glaze_ko)
 
 
 if (MSVC)
-  # glaze_glaze is an INTERFACE library, so these target_compile_options/target_link_options
-  # calls set properties that get applied to whatever *consumes* glaze::glaze, evaluated at
+  # glaze_ko_glaze_ko is an INTERFACE library, so these target_compile_options/target_link_options
+  # calls set properties that get applied to whatever *consumes* glaze_ko::glaze_ko, evaluated at
   # each consumer's own generate time -- not to glaze's own build. A plain CMAKE_CXX_COMPILER_ID
   # check here would instead freeze the *current* (glaze's own configure-time) compiler identity
   # into those properties, which then leaks onto every consumer regardless of what compiler that
@@ -35,7 +35,7 @@ if (MSVC)
   # guards on COMPILE_LANGUAGE: a consumer that compiles C, ISPC or CUDA alongside its C++
   # should not have /Zc:lambda handed to those compilers. Link options have no per-language
   # form, so they stay on CXX_COMPILER_ID alone.
-  target_compile_options(glaze_glaze INTERFACE
+  target_compile_options(glaze_ko_glaze_ko INTERFACE
     # for a C++ standards compliant preprocessor, not needed for clang-cl
     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/Zc:preprocessor>
     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/permissive->
@@ -49,12 +49,12 @@ if (MSVC)
   # in benchmarks/ configure as their own top-level project, so they never saw these
   # flags anyway, and published numbers are measured on GCC. Opt in when profiling
   # glaze itself on MSVC.
-  option(glaze_ENABLE_LTCG "Build with MSVC whole-program optimization (/GL /LTCG)" OFF)
-  if(PROJECT_IS_TOP_LEVEL AND glaze_ENABLE_LTCG)
-    target_compile_options(glaze_glaze INTERFACE
+  option(glaze_ko_ENABLE_LTCG "Build with MSVC whole-program optimization (/GL /LTCG)" OFF)
+  if(PROJECT_IS_TOP_LEVEL AND glaze_ko_ENABLE_LTCG)
+    target_compile_options(glaze_ko_glaze_ko INTERFACE
       $<$<AND:$<COMPILE_LANG_AND_ID:CXX,MSVC>,$<CONFIG:Release>>:/GL>
       $<$<AND:$<COMPILE_LANG_AND_ID:CXX,MSVC>,$<CONFIG:MinSizeRel>>:/GL>)
-    target_link_options(glaze_glaze INTERFACE
+    target_link_options(glaze_ko_glaze_ko INTERFACE
       $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/LTCG>
       $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/INCREMENTAL:NO>
       $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<CONFIG:MinSizeRel>>:/LTCG>
@@ -66,7 +66,7 @@ else()
     $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-Wno-missing-braces>)
 endif()
 
-set_property(TARGET ${PROJECT_NAME}_${PROJECT_NAME} PROPERTY EXPORT_NAME glaze)
+set_property(TARGET ${PROJECT_NAME}_${PROJECT_NAME} PROPERTY EXPORT_NAME glaze_ko)
 
 target_compile_features(${PROJECT_NAME}_${PROJECT_NAME} INTERFACE cxx_std_23)
 target_include_directories(
@@ -74,92 +74,92 @@ target_include_directories(
     INTERFACE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
 )
 
-option(glaze_INSTALL "Generate installation rules for glaze" "${PROJECT_IS_TOP_LEVEL}")
-if(glaze_INSTALL AND NOT CMAKE_SKIP_INSTALL_RULES)
+option(glaze_ko_INSTALL "Generate installation rules for glaze" "${PROJECT_IS_TOP_LEVEL}")
+if(glaze_ko_INSTALL AND NOT CMAKE_SKIP_INSTALL_RULES)
   include(cmake/install-rules.cmake)
 endif()
 
-if (glaze_DEVELOPER_MODE)
+if (glaze_ko_DEVELOPER_MODE)
   include(cmake/dev-mode.cmake)
 endif()
 
-option(glaze_DISABLE_SIMD_WHEN_SUPPORTED
+option(glaze_ko_DISABLE_SIMD_WHEN_SUPPORTED
        "disable SIMD optimizations even when targets support it (e.g. AVX2)" OFF)
-if(glaze_DISABLE_SIMD_WHEN_SUPPORTED)
-  target_compile_definitions(glaze_glaze INTERFACE GLZ_DISABLE_SIMD)
+if(glaze_ko_DISABLE_SIMD_WHEN_SUPPORTED)
+  target_compile_definitions(glaze_ko_glaze_ko INTERFACE GLZKO_DISABLE_SIMD)
 endif()
 
-option(glaze_DISABLE_ALWAYS_INLINE
+option(glaze_ko_DISABLE_ALWAYS_INLINE
        "disable forced inlining to reduce binary size and compilation time" OFF)
-if(glaze_DISABLE_ALWAYS_INLINE)
-  target_compile_definitions(glaze_glaze INTERFACE GLZ_DISABLE_ALWAYS_INLINE)
+if(glaze_ko_DISABLE_ALWAYS_INLINE)
+  target_compile_definitions(glaze_ko_glaze_ko INTERFACE GLZKO_DISABLE_ALWAYS_INLINE)
 endif()
 
-option(glaze_BUILD_EXAMPLES "Build GLAZE examples" OFF)
+option(glaze_ko_BUILD_EXAMPLES "Build GLAZE examples" OFF)
 
-if(glaze_BUILD_EXAMPLES)
+if(glaze_ko_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
 
-option(glaze_EETF_FORMAT "Enable Erlang external term format parsing" OFF)
+option(glaze_ko_EETF_FORMAT "Enable Erlang external term format parsing" OFF)
 
-if(glaze_EETF_FORMAT)
+if(glaze_ko_EETF_FORMAT)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
   find_package(Erlang REQUIRED)
   target_link_libraries(
-    glaze_glaze
+    glaze_ko_glaze_ko
     INTERFACE
       Erlang::EI
       Erlang::Erlang
   )
-  target_compile_definitions(glaze_glaze INTERFACE GLZ_ENABLE_EETF)
-endif(glaze_EETF_FORMAT)
+  target_compile_definitions(glaze_ko_glaze_ko INTERFACE GLZKO_ENABLE_EETF)
+endif(glaze_ko_EETF_FORMAT)
 
-option(glaze_ENABLE_SSL "Enable SSL/TLS support for HTTPS servers" OFF)
+option(glaze_ko_ENABLE_SSL "Enable SSL/TLS support for HTTPS servers" OFF)
 
-if(glaze_ENABLE_SSL)
+if(glaze_ko_ENABLE_SSL)
   find_package(OpenSSL REQUIRED)
   target_link_libraries(
-    glaze_glaze
+    glaze_ko_glaze_ko
     INTERFACE
       OpenSSL::SSL
       OpenSSL::Crypto
   )
-  target_compile_definitions(glaze_glaze INTERFACE GLZ_ENABLE_SSL)
+  target_compile_definitions(glaze_ko_glaze_ko INTERFACE GLZKO_ENABLE_SSL)
 
   # crypt32 is needed to read the Windows ROOT certificate store; see
   # detail::load_os_ca_certificates in include/glaze/net/ssl.hpp for why that is necessary.
   #
   # This is the MinGW half of the requirement. MSVC and clang-cl get crypt32 from the
-  # #pragma comment(lib) in ssl.hpp, which reaches consumers that define GLZ_ENABLE_SSL
+  # #pragma comment(lib) in ssl.hpp, which reaches consumers that define GLZKO_ENABLE_SSL
   # without going through this option; MinGW ignores that pragma, so the option names the
   # library too. Consumers who set the macro by hand under MinGW must do the same.
   #
-  # Consumers that supply their own trust bundle can define GLZ_DISABLE_WINDOWS_CERT_STORE
+  # Consumers that supply their own trust bundle can define GLZKO_DISABLE_WINDOWS_CERT_STORE
   # to compile that code out; crypt32 (a Windows system library) stays on the link line
   # either way, since a consumer-defined macro is not visible here.
   #
   # No ${warning_guard} here: it expands to SYSTEM, which target_link_libraries rejects on
   # an INTERFACE library.
   if(WIN32)
-    target_link_libraries(glaze_glaze INTERFACE crypt32)
+    target_link_libraries(glaze_ko_glaze_ko INTERFACE crypt32)
   endif()
-endif(glaze_ENABLE_SSL)
+endif(glaze_ko_ENABLE_SSL)
 
-option(glaze_ENABLE_REFLECTION26 "Enable C++26 P2996 reflection (requires Bloomberg clang-p2996 or compatible compiler)" OFF)
+option(glaze_ko_ENABLE_REFLECTION26 "Enable C++26 P2996 reflection (requires Bloomberg clang-p2996 or compatible compiler)" OFF)
 
-if(glaze_ENABLE_REFLECTION26)
-  target_compile_definitions(glaze_glaze INTERFACE GLZ_REFLECTION26=1)
-endif(glaze_ENABLE_REFLECTION26)
+if(glaze_ko_ENABLE_REFLECTION26)
+  target_compile_definitions(glaze_ko_glaze_ko INTERFACE GLZKO_REFLECTION26=1)
+endif(glaze_ko_ENABLE_REFLECTION26)
 
 # Make `size` the build-wide default optimization level. Every call site that does not
 # specify a level then drops the 40KB integer table, ~16KB float pow-10 tables, and
 # per-struct hash tables, without having to pass glz::opts_size{} everywhere. Per-call
 # options still win (an explicit optimization_level::normal keeps the fast tables).
-option(glaze_DEFAULT_OPTIMIZATION_SIZE
+option(glaze_ko_DEFAULT_OPTIMIZATION_SIZE
   "Default all (de)serialization to the size-optimized level (drops 40KB int / ~16KB float / per-struct hash tables)" OFF)
 
-if(glaze_DEFAULT_OPTIMIZATION_SIZE)
-  target_compile_definitions(glaze_glaze INTERFACE GLZ_DEFAULT_OPTIMIZATION_SIZE)
-endif(glaze_DEFAULT_OPTIMIZATION_SIZE)
+if(glaze_ko_DEFAULT_OPTIMIZATION_SIZE)
+  target_compile_definitions(glaze_ko_glaze_ko INTERFACE GLZKO_DEFAULT_OPTIMIZATION_SIZE)
+endif(glaze_ko_DEFAULT_OPTIMIZATION_SIZE)
 

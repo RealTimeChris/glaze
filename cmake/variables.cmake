@@ -8,11 +8,11 @@ include(CMakeDependentOption)
 # consumers can trivially build and package the project
 if(PROJECT_IS_TOP_LEVEL)
   cmake_dependent_option(
-    glaze_DEVELOPER_MODE "Enable developer mode" ON
+    glaze_ko_DEVELOPER_MODE "Enable developer mode" ON
     "PROJECT_IS_TOP_LEVEL" OFF
   )
   cmake_dependent_option(
-    glaze_ENABLE_FUZZING "Enable building fuzzers" ON
+    glaze_ko_ENABLE_FUZZING "Enable building fuzzers" ON
     "PROJECT_IS_TOP_LEVEL" OFF
   )
 endif()
@@ -26,12 +26,12 @@ endif()
 set(warning_guard "")
 if(NOT PROJECT_IS_TOP_LEVEL)
   option(
-      glaze_INCLUDES_WITH_SYSTEM
+      glaze_ko_INCLUDES_WITH_SYSTEM
       "Use SYSTEM modifier for glaze's includes, disabling warnings"
       ON
   )
-  mark_as_advanced(glaze_INCLUDES_WITH_SYSTEM)
-  if(glaze_INCLUDES_WITH_SYSTEM)
+  mark_as_advanced(glaze_ko_INCLUDES_WITH_SYSTEM)
+  if(glaze_ko_INCLUDES_WITH_SYSTEM)
     set(warning_guard SYSTEM)
   endif()
 endif()
