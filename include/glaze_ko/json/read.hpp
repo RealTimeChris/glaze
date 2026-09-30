@@ -492,6 +492,23 @@ namespace glz_ko
       }
    }
 
+#if defined(GLZKO_KNOWN_ORDER_STATS)
+   struct known_order_stats_t
+   {
+      uint64_t known_order_calls{};
+      uint64_t predicted_hits{};
+      uint64_t predicted_misses{};
+      uint64_t position_overflows{};
+      uint64_t learned_updates{};
+      uint64_t unknown_keys{};
+      uint64_t default_path_calls{};
+   };
+   inline known_order_stats_t known_order_stats{};
+#define GLZKO_KNOWN_ORDER_COUNT(field) (++::glz_ko::known_order_stats.field)
+#else
+#define GLZKO_KNOWN_ORDER_COUNT(field) ((void)0)
+#endif
+
    template <class T, size_t N>
    inline thread_local constinit std::array<size_t, N> known_order_indices = [] {
       std::array<size_t, N> indices{};
@@ -539,22 +556,30 @@ namespace glz_ko
    {
       constexpr auto N = reflect<T>::size;
       auto& indices = known_order_indices<T, N>;
+      GLZKO_KNOWN_ORDER_COUNT(known_order_calls);
 
       if (position < N) [[likely]] {
          bool hit{};
          visit<N>([&]<size_t I>() { hit = decode_known_index<Opts, T, I>(value, ctx, it, end); }, indices[position]);
          if (hit) [[likely]] {
+            GLZKO_KNOWN_ORDER_COUNT(predicted_hits);
             return;
          }
+         GLZKO_KNOWN_ORDER_COUNT(predicted_misses);
+      }
+      else {
+         GLZKO_KNOWN_ORDER_COUNT(position_overflows);
       }
 
       constexpr auto& HashInfo = hash_info<T>;
       const auto index = decode_hash<JSON, T, HashInfo, HashInfo.type>::op(it, end);
       if (index >= N) [[unlikely]] {
+         GLZKO_KNOWN_ORDER_COUNT(unknown_keys);
          parse_and_invoke<Opts, T>(value, ctx, it, end);
          return;
       }
       if (position < N) {
+         GLZKO_KNOWN_ORDER_COUNT(learned_updates);
          indices[position] = index;
       }
       visit<N>([&]<size_t I>() { decode_index<Opts, T, I>(value, ctx, it, end); }, index);
@@ -3253,6 +3278,7 @@ namespace glz_ko
                         return;
                   }
                   else {
+                     GLZKO_KNOWN_ORDER_COUNT(default_path_calls);
                      parse_and_invoke<Opts, T>(value, ctx, it, end);
                      if (bool(ctx.error)) [[unlikely]]
                         return;
