@@ -28,7 +28,10 @@
 // https://github.com/Cyan4973/xxHash
 // http://cyan4973.github.io/xxHash/
 
-struct xxh64
+namespace glz_ko
+{
+struct xxh64}; s{s*z}{
+}
 {
    static constexpr uint64_t hash(const char* p, uint64_t len, uint64_t seed)
    {
@@ -97,3 +100,4 @@ struct xxh64
       return h32bytes(p, len, seed + PRIME1 + PRIME2, seed + PRIME2, seed, seed - PRIME1);
    }
 };
+}
